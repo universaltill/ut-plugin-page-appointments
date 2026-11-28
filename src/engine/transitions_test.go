@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -14,13 +15,15 @@ var allowedRows = map[[2]State]bool{
 	{Confirmed, NoShow}:    true,
 	{CheckedIn, InService}: true, {CheckedIn, CancelledByClient}: true, {CheckedIn, CancelledByShop}: true,
 	{InService, Completed}: true,
+	// ADR-0221 B8 / legal 7: additive corrections.
+	{CheckedIn, Booked}: true, {InService, CancelledByShop}: true, {NoShow, CheckedIn}: true,
 }
 
 var allStates = []State{Booked, Confirmed, CheckedIn, InService, Completed, CancelledByClient, CancelledByShop, NoShow}
 
 func TestTransitions_AllPairs(t *testing.T) {
-	if len(allowedRows) != 13 {
-		t.Fatal("expected 13 allowed rows")
+	if len(allowedRows) != 16 {
+		t.Fatal("expected 16 allowed rows")
 	}
 	start := jan14(t, 14, 0)
 	now := start.Add(time.Hour) // after grace, so no_show is allowed
@@ -30,7 +33,7 @@ func TestTransitions_AllPairs(t *testing.T) {
 			n++
 			t.Run(string(from)+"->"+string(to), func(t *testing.T) {
 				a := appt("a1", "r1", from, start, 30, 0)
-				got, ev, err := Transition(a, TransitionInput{To: to, ActorUserID: "u1", SaleRef: "s-1", Now: now}, DefaultPolicy(), counterIDs("ev"))
+				got, ev, err := Transition(a, TransitionInput{To: to, ActorUserID: "u1", SaleRef: "s-1", Now: now, Reason: "because", ByManager: true}, DefaultPolicy(), counterIDs("ev"))
 				if allowedRows[[2]State{from, to}] {
 					if err != nil || got.State != to {
 						t.Fatalf("want ok, got %v state %s", err, got.State)
@@ -79,6 +82,9 @@ func TestTransitions_NoShowGrace(t *testing.T) {
 	}
 	if !errors.Is(try(CheckedIn, 15, at(3600)), ErrTransitionNotAllowed) {
 		t.Fatal("checked_in -> no_show is not allowed")
+	}
+	if !errors.Is(try(InService, 15, at(3600)), ErrTransitionNotAllowed) {
+		t.Fatal("in_service -> no_show is not allowed")
 	}
 	if try(Booked, 0, at(0)) != nil {
 		t.Fatal("grace 0")
@@ -198,5 +204,66 @@ func TestTransitions_Supersede(t *testing.T) {
 	c.Start, c.End = old.Start, old.End
 	if _, err := CheckConflict(c, []Appointment{old}, DefaultPolicy(), nil, fakeClock{ns}, counterIDs("e")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTransitions_NoShowUndo(t *testing.T) {
+	start := jan14(t, 10, 0)
+	now := start.Add(20 * time.Minute)
+	a := appt("a", "r1", NoShow, start, 30, 0)
+	rows := []struct {
+		name string
+		in   TransitionInput
+		want error
+	}{
+		{"manager with reason", TransitionInput{To: CheckedIn, ActorUserID: "m1", Now: now, ByManager: true, Reason: "client arrived at 10:16"}, nil},
+		{"not a manager", TransitionInput{To: CheckedIn, ActorUserID: "u1", Now: now, Reason: "x"}, ErrOverrideNotAllowed},
+		{"empty reason", TransitionInput{To: CheckedIn, ActorUserID: "m1", Now: now, ByManager: true}, ErrReasonRequired},
+		{"blank reason", TransitionInput{To: CheckedIn, ActorUserID: "m1", Now: now, ByManager: true, Reason: " \t "}, ErrReasonRequired},
+		{"reason 501 runes", TransitionInput{To: CheckedIn, ActorUserID: "m1", Now: now, ByManager: true, Reason: strings.Repeat("é", 501)}, ErrInvalid},
+		{"reason 500 runes", TransitionInput{To: CheckedIn, ActorUserID: "m1", Now: now, ByManager: true, Reason: strings.Repeat("é", 500)}, nil},
+		{"no actor", TransitionInput{To: CheckedIn, Now: now, ByManager: true, Reason: "x"}, ErrInvalid},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			got, ev, err := Transition(a, r.in, DefaultPolicy(), counterIDs("e"))
+			if r.want != nil {
+				if !errors.Is(err, r.want) || got.State != NoShow || ev.ID != "" {
+					t.Fatalf("want %v got %v %s %+v", r.want, err, got.State, ev)
+				}
+				return
+			}
+			if err != nil || got.State != CheckedIn || ev.Reason != strings.TrimSpace(r.in.Reason) ||
+				ev.FromState != NoShow || ev.ToState != CheckedIn || ev.ActorUserID != r.in.ActorUserID {
+				t.Fatalf("%v %s %+v", err, got.State, ev)
+			}
+		})
+	}
+}
+
+func TestTransitions_ShopCancelInService(t *testing.T) {
+	start := jan14(t, 10, 0)
+	a := appt("a", "r1", InService, start, 30, 0)
+	for _, reason := range []string{"", "  "} {
+		got, ev, err := Transition(a, TransitionInput{To: CancelledByShop, ActorUserID: "u1", Now: start, Reason: reason}, DefaultPolicy(), counterIDs("e"))
+		if !errors.Is(err, ErrReasonRequired) || got.State != InService || ev.ID != "" {
+			t.Fatalf("%q: %v", reason, err)
+		}
+	}
+	got, ev, err := Transition(a, TransitionInput{To: CancelledByShop, ActorUserID: "u1", Now: start, Reason: "wrong appointment"}, DefaultPolicy(), counterIDs("e"))
+	if err != nil || got.State != CancelledByShop || ev.Reason != "wrong appointment" || got.LateCancel {
+		t.Fatalf("%v %+v %+v", err, got, ev)
+	}
+	// from booked, a shop cancel keeps needing no reason.
+	if _, _, err := Transition(appt("b", "r1", Booked, start, 30, 0), TransitionInput{To: CancelledByShop, ActorUserID: "u1", Now: start}, DefaultPolicy(), counterIDs("e")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransitions_UndoCheckIn(t *testing.T) {
+	start := jan14(t, 10, 0)
+	got, ev, err := Transition(appt("a", "r1", CheckedIn, start, 30, 0), TransitionInput{To: Booked, ActorUserID: "u1", Now: start}, DefaultPolicy(), counterIDs("e"))
+	if err != nil || got.State != Booked || ev.FromState != CheckedIn || ev.ToState != Booked {
+		t.Fatalf("%v %+v", err, ev)
 	}
 }
