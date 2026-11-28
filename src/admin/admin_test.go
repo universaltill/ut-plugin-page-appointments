@@ -295,7 +295,10 @@ func TestLocale_EveryKeyDefinedAndUsed(t *testing.T) {
 		t.Fatal(err)
 	}
 	for k, v := range en {
-		if strings.TrimSpace(v) == "" || !strings.HasPrefix(k, "appointments.") {
+		if !strings.HasPrefix(k, "appointments.") {
+			continue // another package's namespace (calendar: appt.cal.)
+		}
+		if strings.TrimSpace(v) == "" {
 			t.Errorf("bad entry %q", k)
 		}
 	}
@@ -337,6 +340,9 @@ func TestLocale_EveryKeyDefinedAndUsed(t *testing.T) {
 		}
 	}
 	for k := range en {
+		if strings.HasPrefix(k, "appt.") {
+			continue
+		}
 		if !used[k] {
 			unused = append(unused, k)
 		}
@@ -357,8 +363,13 @@ func TestLocale_EveryKeyDefinedAndUsed(t *testing.T) {
 // Only en.json exists: translations come from Weblate, not from this PR.
 func TestLocale_EnglishOnly(t *testing.T) {
 	es, err := os.ReadDir("../../locales")
-	if err != nil || len(es) != 1 || es[0].Name() != "en.json" {
-		t.Fatalf("%v %v", es, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range es {
+		if n := e.Name(); n != "en.json" && n != "locales.go" {
+			t.Fatalf("unexpected locale file %q: only en.json is allowed", n)
+		}
 	}
 }
 

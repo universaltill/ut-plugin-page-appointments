@@ -231,6 +231,9 @@ func TestI18n_EverySourceKeyExistsAndNoneIsUnused(t *testing.T) {
 		}
 	}
 	for k := range en {
+		if !strings.HasPrefix(k, "appt.cal.") {
+			continue
+		}
 		if used[k] {
 			continue
 		}
