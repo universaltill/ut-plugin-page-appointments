@@ -665,8 +665,9 @@ func TestAdmin_DefaultCheckFailsClosed(t *testing.T) {
 	}
 }
 
-// N10 / N12: the texts claim only what is true until a purge trigger and a
-// completion path exist.
+// N10 / N12: the texts claim only what is true. The purge now runs on the
+// schedule tick and before every calendar view (#7208), so the privacy text
+// says names are blanked and no longer that blanking is off (fix-plug 4).
 func TestLocale_NoClaimsWithoutAPath(t *testing.T) {
 	raw, err := os.ReadFile("../../locales/en.json")
 	if err != nil {
@@ -676,8 +677,8 @@ func TestLocale_NoClaimsWithoutAPath(t *testing.T) {
 	if err := json.Unmarshal(raw, &en); err != nil {
 		t.Fatal(err)
 	}
-	if v := en["appointments.admin.settings.privacy"]; strings.Contains(v, "automatically") {
-		t.Fatalf("privacy text claims automatic blanking: %q", v)
+	if v := en["appointments.admin.settings.privacy"]; strings.Contains(v, "not switched on") || !strings.Contains(v, "blanked") {
+		t.Fatalf("privacy text does not match the wired purge: %q", v)
 	}
 	if v := en["appt.cal.complete_at_till"]; strings.Contains(v, "at the till") {
 		t.Fatalf("completion text promises a path that does not exist: %q", v)

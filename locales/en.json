@@ -74,7 +74,7 @@
   "appointments.admin.settings.field.slot_step": "Slot step (minutes)",
   "appointments.admin.settings.field.zone": "Shop time zone (for example Europe/London)",
   "appointments.admin.settings.intro": "How the calendar books and what happens at the desk.",
-  "appointments.admin.settings.privacy": "Only a first name is kept for each booking. The retention period below is the longest it may be kept; blanking older names is not switched on yet. Do not type phone numbers, email addresses or notes anywhere.",
+  "appointments.admin.settings.privacy": "Only a first name is kept for each booking. The retention period below is the longest it is kept: after that the name is blanked on the booking. Do not type phone numbers, email addresses or notes anywhere.",
   "appointments.admin.settings.title": "Appointment settings",
   "appointments.admin.timeoff.add": "Add time off",
   "appointments.admin.timeoff.add_submit": "Add",
