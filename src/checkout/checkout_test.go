@@ -107,6 +107,20 @@ type fakeStore struct {
 	outbox  map[string]Completion
 	order   []string
 	failCom bool
+	// beforeCommit runs inside Commit before the guard, as another event
+	// would between the processor's read and its write.
+	beforeCommit func(s *fakeStore)
+	// currency by appointment id; "" means GBP.
+	currency map[string]string
+}
+
+func (s *fakeStore) Currency(id string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c := s.currency[id]; c != "" {
+		return c, nil
+	}
+	return "GBP", nil
 }
 
 func newStore(as ...engine.Appointment) *fakeStore {
@@ -122,11 +136,18 @@ func (s *fakeStore) Appointment(id string) (engine.Appointment, bool, error) {
 	a, ok := s.appts[id]
 	return a, ok, nil
 }
-func (s *fakeStore) Commit(a engine.Appointment, evs []engine.Event, c Completion) error {
+func (s *fakeStore) Commit(from engine.State, a engine.Appointment, evs []engine.Event, c Completion) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.failCom {
 		return errors.New("db down")
+	}
+	if f := s.beforeCommit; f != nil {
+		s.beforeCommit = nil
+		f(s)
+	}
+	if s.appts[a.ID].State != from {
+		return ErrConflict
 	}
 	s.appts[a.ID] = a
 	s.events = append(s.events, evs...)
@@ -188,8 +209,7 @@ func newProc(st *fakeStore, pub *fakePub) *Processor {
 	n := 0
 	return &Processor{
 		Store: st, Pub: pub, Clock: fixedClock{}, Policy: engine.DefaultPolicy(),
-		IDs:      func() string { n++; return fmt.Sprintf("ev%d", n) },
-		Currency: "GBP",
+		IDs: func() string { n++; return fmt.Sprintf("ev%d", n) },
 		StaffRef: func(r string) string {
 			if r == "r1" {
 				return "staff-9"
@@ -458,5 +478,42 @@ func TestConcurrentRedelivery_RaceFree(t *testing.T) {
 	wg.Wait()
 	if len(st.events) != 1 || len(pub.got) != 1 {
 		t.Fatalf("events %d published %d", len(st.events), len(pub.got))
+	}
+}
+
+// N5: the completed event carries the appointment record's own currency.
+func TestCompleted_UsesTheRecordCurrency_N5(t *testing.T) {
+	st := newStore(appt(engine.InService))
+	st.currency = map[string]string{"a1": "EUR"}
+	pub := &fakePub{}
+	p := newProc(st, pub)
+	if _, err := p.CompleteByReceipt("a1", "sale-1", "u1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(pub.got) != 1 || !strings.Contains(pub.got[0], `"currency":"EUR"`) {
+		t.Fatalf("published %+v", pub.got)
+	}
+}
+
+// Another event completes the visit with a different sale between this
+// completion's read and its write: the guarded write refuses, the first sale
+// stays, and the outcome is OtherSale (fix-plug finding 1).
+func TestCompletionRacedByAnotherSaleIsOtherSale(t *testing.T) {
+	st := newStore(appt(engine.InService))
+	st.beforeCommit = func(s *fakeStore) {
+		a := s.appts["a1"]
+		a.State, a.SaleRef = engine.Completed, "sale-0"
+		s.appts["a1"] = a
+	}
+	p := newProc(st, &fakePub{})
+	r, err := p.HandleSaleCompleted(sale("sale-1", "appt:a1:0", "appt:a1:1"), "u1")
+	if err != nil || len(r) != 1 || r[0].Outcome != OtherSale {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if got := st.appts["a1"].SaleRef; got != "sale-0" {
+		t.Fatalf("sale ref overwritten: %q", got)
+	}
+	if len(st.outbox) != 0 {
+		t.Fatalf("outbox written: %+v", st.outbox)
 	}
 }

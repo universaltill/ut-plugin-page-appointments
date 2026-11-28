@@ -81,7 +81,10 @@ func (e *env) quickCheckIn(tk string) (*Document, error) {
 		return nil, err
 	}
 	nb := Booking{Appointment: next, FirstName: b.FirstName}
-	if err := e.deps.Store.Commit(Change{Update: &nb, Events: []engine.Event{ev}}); err != nil {
+	if err := e.deps.Store.Commit(Change{Update: &nb, From: b.State, Events: []engine.Event{ev}}); err != nil {
+		if errors.Is(err, ErrGone) { // moved by another event since it was read
+			return e.todayDocument(e.errNotice(errGone))
+		}
 		return nil, err
 	}
 	return e.todayDocument(notice("info", e.t.lit("appt.cal.done", e.t.s("appt.cal.v.checkin"), e.clientName(b))))

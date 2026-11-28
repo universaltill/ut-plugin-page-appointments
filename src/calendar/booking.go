@@ -262,7 +262,7 @@ func (e *env) findTimes(a Ask, moveID string) (*Document, error) {
 	if err != nil {
 		return e.stepOneError(a, moveID, date, err)
 	}
-	slots, err := e.freeSlots(p.staff.ID, mustReq(e, p.svc), p.date, moveID)
+	slots, err := e.freeSlots(p.staff.ID, mustReq(e, p), p.date, moveID)
 	if err != nil {
 		return e.stepOneError(a, moveID, p.date, err)
 	}
@@ -281,9 +281,26 @@ func createAction(moveID string) string {
 	return "create"
 }
 
-func mustReq(e *env, svc ServiceInfo) engine.Request {
-	r, _ := e.request(svc)
+func mustReq(e *env, p picked) engine.Request {
+	r, _ := e.requestFor(p)
 	return r
+}
+
+// requestFor is request, except that a move keeps the booked duration and
+// buffer: the offered slots must fit what is stored, not the service's
+// current length (a duration edit since the booking would offer a slot the
+// conflict check then refuses).
+func (e *env) requestFor(p picked) (engine.Request, engine.Line) {
+	svc := p.svc
+	if p.moveOld != nil && len(p.moveOld.Lines) > 0 {
+		var dur int
+		for _, l := range p.moveOld.Lines {
+			dur += l.DurationMin
+		}
+		svc.DurationMin = dur
+		svc.BufferMin = p.moveOld.BufferMin
+	}
+	return e.request(svc)
 }
 
 func (e *env) formDoc(moveID string, p picked, f bookingForm, lead ...Component) (*Document, error) {
@@ -351,7 +368,7 @@ func (e *env) place(a Ask, moveID string) (*Document, error) {
 	if err != nil {
 		return e.stepOneError(a, moveID, date, err)
 	}
-	req, line := e.request(p.svc)
+	req, line := e.requestFor(p)
 	override := formBool(a.Form, "override")
 	actor := e.op.ActorID()
 	if override && !e.canOverride() {
@@ -416,6 +433,9 @@ func (e *env) place(a Ask, moveID string) (*Document, error) {
 		ch.Superseded = p.moveOld.ID
 	}
 	if err := e.deps.Store.Commit(ch); err != nil {
+		if errors.Is(err, engine.ErrConflict) { // another event took the slot since the check
+			return e.retry(a, moveID, p, e.errNotice(errSlotTaken))
+		}
 		return nil, err
 	}
 	msg := "appt.cal.booked"
@@ -451,7 +471,7 @@ func (e *env) localTime(d engine.Date, s string) (time.Time, error) {
 
 // retry shows the time step again with a notice, keeping what was chosen.
 func (e *env) retry(a Ask, moveID string, p picked, lead ...Component) (*Document, error) {
-	slots, err := e.freeSlots(p.staff.ID, mustReq(e, p.svc), p.date, moveID)
+	slots, err := e.freeSlots(p.staff.ID, mustReq(e, p), p.date, moveID)
 	if err != nil {
 		return e.stepOneError(a, moveID, p.date, err)
 	}

@@ -123,7 +123,8 @@ func (e *env) detail(b Booking, lead ...Component) *Document {
 	if b.State == engine.NoShow && !e.op.IsManager() {
 		doc.Components = append(doc.Components, para(Key("appt.cal.ask_manager")))
 	}
-	if b.State == engine.InService {
+	doc.Components = append(doc.Components, e.deskButtons(b)...)
+	if b.State == engine.InService && !e.canReceipt(b) {
 		doc.Components = append(doc.Components, para(Key("appt.cal.complete_at_till")))
 	}
 	if (b.State == engine.Booked || b.State == engine.Confirmed) && !e.hasVerb(vs, "noshow") {
@@ -224,7 +225,10 @@ func (e *env) do(a Ask, v verb, b Booking) (*Document, error) {
 		events = append(events, res.Events...)
 	}
 	nb := Booking{Appointment: next, FirstName: b.FirstName}
-	if err := e.deps.Store.Commit(Change{Update: &nb, Events: events}); err != nil {
+	if err := e.deps.Store.Commit(Change{Update: &nb, From: b.State, Events: events}); err != nil {
+		if errors.Is(err, ErrGone) { // moved by another event since it was read
+			return e.dayDocument(day, e.errNotice(errGone))
+		}
 		return nil, err
 	}
 	msg := notice("info", e.t.lit("appt.cal.done", e.t.s(v.label), e.clientName(b)))

@@ -7,24 +7,25 @@ import (
 	"strings"
 	"time"
 
+	"github.com/universaltill/ut-plugin-page-appointments/locales"
 	"github.com/universaltill/ut-plugin-page-appointments/src/engine"
 	"github.com/universaltill/ut-plugin-page-appointments/src/store"
 )
 
-func (h *Handler) build(ctx context.Context, view, resource string, n *Notice) (Document, error) {
+func (h *Handler) build(ctx context.Context, view, locale, resource string, n *Notice) (Document, error) {
 	var (
 		doc Document
 		err error
 	)
 	switch view {
 	case ViewResources:
-		doc, err = h.resourcesDoc(ctx)
+		doc, err = h.resourcesDoc(ctx, locale, resource)
 	case ViewServices:
-		doc, err = h.servicesDoc(ctx)
+		doc, err = h.servicesDoc(ctx, locale)
 	case ViewHours:
 		doc, err = h.hoursDoc(ctx, resource)
 	case ViewTimeOff:
-		doc, err = h.timeOffDoc(ctx)
+		doc, err = h.timeOffDoc(ctx, locale)
 	case ViewSettings:
 		doc, err = h.settingsDoc(ctx)
 	default:
@@ -44,6 +45,10 @@ func newDoc(titleKey string, cs ...Component) Document {
 	return Document{Version: 1, Title: &t, Components: cs}
 }
 
+// cell resolves a table cell, which carries plain text, through the bundle
+// (the host only translates keys, not cells).
+func cell(locale, key string) string { return locales.Lookup(locale, key) }
+
 func yesNo(b bool, yes, no string) string {
 	if b {
 		return yes
@@ -62,7 +67,7 @@ func resourceOptions(rs []store.ResourceRecord, withNew bool) []Option {
 	return out
 }
 
-func (h *Handler) resourcesDoc(ctx context.Context) (Document, error) {
+func (h *Handler) resourcesDoc(ctx context.Context, locale, selected string) (Document, error) {
 	rs, err := h.Repo.Resources(ctx)
 	if err != nil {
 		return Document{}, err
@@ -74,28 +79,43 @@ func (h *Handler) resourcesDoc(ctx context.Context) (Document, error) {
 	} else {
 		rows := make([][]any, len(rs))
 		for i, r := range rs {
-			rows[i] = []any{r.DisplayName, r.Kind, yesNo(r.Active, "active", "inactive"), r.LogbookStaffRef}
+			rows[i] = []any{r.DisplayName, cell(locale, "appointments.admin.resources.kind."+r.Kind), cell(locale, yesNo(r.Active, "appointments.admin.resources.status.active", "appointments.admin.resources.status.inactive")), r.LogbookStaffRef}
 		}
 		cs = append(cs, table([]Column{
 			{K("appointments.admin.resources.col.name"), "text"}, {K("appointments.admin.resources.col.kind"), "text"},
 			{K("appointments.admin.resources.col.status"), "text"}, {K("appointments.admin.resources.col.logbook"), "text"},
 		}, rows))
 	}
-	cs = append(cs, heading("appointments.admin.resources.form"), paragraph("appointments.admin.resources.logbook_hint"),
+	cur := store.ResourceRecord{Resource: engine.Resource{ID: newResource, Kind: "staff", Active: true}}
+	for _, r := range rs {
+		if r.ID == selected {
+			cur = r
+		}
+	}
+	status := "active"
+	if !cur.Active {
+		status = "inactive"
+	}
+	cs = append(cs, heading("appointments.admin.resources.form"), paragraph("appointments.admin.resources.logbook_hint"))
+	if len(rs) > 0 {
+		cs = append(cs, form(ActShowResource, "appointments.admin.resources.show",
+			Field{Name: "resource", Label: K("appointments.admin.resources.field.resource"), Kind: "select", Options: resourceOptions(rs, true), Value: cur.ID}))
+	}
+	cs = append(cs,
 		form(ActSaveResource, "appointments.admin.save",
-			Field{Name: "resource", Label: K("appointments.admin.resources.field.resource"), Kind: "select", Options: resourceOptions(rs, true), Value: newResource},
-			Field{Name: "name", Label: K("appointments.admin.resources.field.name"), Kind: "text", Required: true},
-			Field{Name: "kind", Label: K("appointments.admin.resources.field.kind"), Kind: "select", Value: "staff", Options: []Option{
+			Field{Name: "resource", Label: K("appointments.admin.resources.field.resource"), Kind: "select", Options: resourceOptions(rs, true), Value: cur.ID},
+			Field{Name: "name", Label: K("appointments.admin.resources.field.name"), Kind: "text", Required: true, Value: cur.DisplayName},
+			Field{Name: "kind", Label: K("appointments.admin.resources.field.kind"), Kind: "select", Value: cur.Kind, Options: []Option{
 				{"staff", K("appointments.admin.resources.kind.staff")}, {"chair", K("appointments.admin.resources.kind.chair")}}},
-			Field{Name: "colour", Label: K("appointments.admin.resources.field.colour"), Kind: "text"},
-			Field{Name: "status", Label: K("appointments.admin.resources.field.status"), Kind: "select", Value: "active", Options: []Option{
+			Field{Name: "colour", Label: K("appointments.admin.resources.field.colour"), Kind: "text", Value: cur.Colour},
+			Field{Name: "status", Label: K("appointments.admin.resources.field.status"), Kind: "select", Value: status, Options: []Option{
 				{"active", K("appointments.admin.resources.status.active")}, {"inactive", K("appointments.admin.resources.status.inactive")}}},
-			Field{Name: "logbook_staff_ref", Label: K("appointments.admin.resources.field.logbook"), Kind: "text"},
+			Field{Name: "logbook_staff_ref", Label: K("appointments.admin.resources.field.logbook"), Kind: "text", Value: cur.LogbookStaffRef},
 		))
 	return newDoc(kTitleResources, cs...), nil
 }
 
-func (h *Handler) servicesDoc(ctx context.Context) (Document, error) {
+func (h *Handler) servicesDoc(ctx context.Context, locale string) (Document, error) {
 	svcs, err := h.Repo.Services(ctx)
 	if err != nil {
 		return Document{}, err
@@ -132,7 +152,7 @@ func (h *Handler) servicesDoc(ctx context.Context) (Document, error) {
 					price = Money(p, set.Currency)
 				}
 			}
-			rows[i] = []any{s.SKU, s.DurationMin, s.BufferMin, who, yesNo(s.Active, "active", "inactive"), price}
+			rows[i] = []any{s.SKU, s.DurationMin, s.BufferMin, who, cell(locale, yesNo(s.Active, "appointments.admin.resources.status.active", "appointments.admin.resources.status.inactive")), price}
 		}
 		cs = append(cs, table([]Column{
 			{K("appointments.admin.services.col.sku"), "text"}, {K("appointments.admin.services.col.duration"), "number"},
@@ -213,7 +233,7 @@ func (h *Handler) hoursDoc(ctx context.Context, resourceID string) (Document, er
 	return newDoc(kTitleHours, cs...), nil
 }
 
-func (h *Handler) timeOffDoc(ctx context.Context) (Document, error) {
+func (h *Handler) timeOffDoc(ctx context.Context, locale string) (Document, error) {
 	rs, err := h.Repo.Resources(ctx)
 	if err != nil {
 		return Document{}, err
@@ -241,7 +261,7 @@ func (h *Handler) timeOffDoc(ctx context.Context) (Document, error) {
 		rows := make([][]any, len(tos))
 		opts := make([]Option, len(tos))
 		for i, t := range tos {
-			rows[i] = []any{names[t.ResourceID], t.From.In(loc).Format(dtLayout), t.To.In(loc).Format(dtLayout), t.Reason}
+			rows[i] = []any{names[t.ResourceID], t.From.In(loc).Format(dtLayout), t.To.In(loc).Format(dtLayout), cell(locale, "appointments.admin.timeoff.reason."+t.Reason)}
 			opts[i] = Option{Value: t.ID, Label: L(names[t.ResourceID] + " " + t.From.In(loc).Format(dtLayout))}
 		}
 		cs = append(cs, table([]Column{

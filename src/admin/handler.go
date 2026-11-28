@@ -121,7 +121,7 @@ func (h *Handler) HandleView(ctx context.Context, req ViewRequest) (Response, er
 	if !h.allowed(req.Operator) {
 		return docResp(errDoc("appointments.admin.error.forbidden")), nil
 	}
-	doc, err := h.build(ctx, req.View, req.Params["resource"], nil)
+	doc, err := h.build(ctx, req.View, req.Locale, req.Params["resource"], nil)
 	if err != nil {
 		return Response{}, err
 	}
@@ -142,11 +142,13 @@ func (h *Handler) HandleAction(ctx context.Context, req ActionRequest) (Response
 		resource string
 	)
 	if len(req.Invalid) > 0 {
-		return h.answer(ctx, req.View, "", errors.New("form"), "appointments.admin.error.form")
+		return h.answer(ctx, req.View, req.Locale, "", errors.New("form"), "appointments.admin.error.form")
 	}
 	switch req.Action {
 	case ActSaveResource:
-		err = h.saveResource(ctx, f)
+		resource, err = h.saveResource(ctx, f)
+	case ActShowResource:
+		resource = f.str("resource")
 	case ActSaveService:
 		err = h.saveService(ctx, f)
 	case ActShowHours:
@@ -164,22 +166,22 @@ func (h *Handler) HandleAction(ctx context.Context, req ActionRequest) (Response
 	case ActSaveSettings:
 		err = h.saveSettings(ctx, f)
 	default:
-		return h.answer(ctx, req.View, "", errors.New("unknown"), "appointments.admin.error.unknown")
+		return h.answer(ctx, req.View, req.Locale, "", errors.New("unknown"), "appointments.admin.error.unknown")
 	}
 	if err != nil {
-		return h.answer(ctx, req.View, resource, err, ErrorKey(err))
+		return h.answer(ctx, req.View, req.Locale, resource, err, ErrorKey(err))
 	}
 	ok := notice("info", "appointments.admin.saved")
-	doc, berr := h.build(ctx, req.View, resource, &ok)
+	doc, berr := h.build(ctx, req.View, req.Locale, resource, &ok)
 	if berr != nil {
 		return Response{}, berr
 	}
 	return docResp(doc), nil
 }
 
-func (h *Handler) answer(ctx context.Context, view, resource string, _ error, key string) (Response, error) {
+func (h *Handler) answer(ctx context.Context, view, locale, resource string, _ error, key string) (Response, error) {
 	n := notice("error", key)
-	doc, err := h.build(ctx, view, resource, &n)
+	doc, err := h.build(ctx, view, locale, resource, &n)
 	if err != nil {
 		return Response{}, err
 	}
@@ -248,17 +250,36 @@ var skuPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 const newResource = "_new"
 
-func (h *Handler) saveResource(ctx context.Context, f formValues) error {
+// saveResource writes the resource and returns its id (the page then shows
+// it pre-filled). A field the form does not carry keeps the stored value, so
+// a partial post never wipes the logbook link, colour or kind (review N3).
+func (h *Handler) saveResource(ctx context.Context, f formValues) (string, error) {
 	id := f.str("resource")
+	rec := store.ResourceRecord{Resource: engine.Resource{Kind: "staff", Active: true}}
 	if id == "" || id == newResource {
 		id = h.NewID()
-	} else if _, err := h.Repo.Resource(ctx, id); err != nil {
-		return err
+	} else {
+		cur, err := h.Repo.Resource(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		rec = cur
 	}
-	return h.Repo.SaveResource(ctx, store.ResourceRecord{
-		Resource:    engine.Resource{ID: id, Kind: f.str("kind"), Active: f.str("status") != "inactive"},
-		DisplayName: f.str("name"), Colour: f.str("colour"), LogbookStaffRef: f.str("logbook_staff_ref"),
-	})
+	rec.ID = id
+	rec.DisplayName = f.str("name")
+	if _, ok := f.m["kind"]; ok {
+		rec.Kind = f.str("kind")
+	}
+	if _, ok := f.m["status"]; ok {
+		rec.Active = f.str("status") != "inactive"
+	}
+	if _, ok := f.m["colour"]; ok {
+		rec.Colour = f.str("colour")
+	}
+	if _, ok := f.m["logbook_staff_ref"]; ok {
+		rec.LogbookStaffRef = f.str("logbook_staff_ref")
+	}
+	return id, h.Repo.SaveResource(ctx, rec)
 }
 
 func (h *Handler) saveService(ctx context.Context, f formValues) error {
