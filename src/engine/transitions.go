@@ -3,14 +3,18 @@ package engine
 import (
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // allowedTransitions is the single source of truth for the state machine.
 var allowedTransitions = map[State][]State{
 	Booked:    {Confirmed, CheckedIn, CancelledByClient, CancelledByShop, NoShow},
 	Confirmed: {CheckedIn, CancelledByClient, CancelledByShop, NoShow},
-	CheckedIn: {InService, CancelledByClient, CancelledByShop},
-	InService: {Completed},
+	// CheckedIn -> Booked undoes a mis-tap; the corrections below are additive
+	// (appointment-v1 section 2, ADR-0221 B8, legal finding 7).
+	CheckedIn: {InService, Booked, CancelledByClient, CancelledByShop},
+	InService: {Completed, CancelledByShop},
+	NoShow:    {CheckedIn},
 }
 
 func allowed(from, to State) bool {
@@ -28,9 +32,17 @@ type TransitionInput struct {
 	ActorUserID string
 	SaleRef     string
 	Now         time.Time
+	// Reason is mandatory for the two corrections no_show -> checked_in and
+	// in_service -> cancelled_by_shop (at most MaxOverrideReasonRunes). It is
+	// trimmed and recorded on the event.
+	Reason string
+	// ByManager is asserted by the host's permission layer; no_show ->
+	// checked_in needs it.
+	ByManager bool
 }
 
-// Transition moves a to in.To. Validation order: table, no_show grace,
+// Transition moves a to in.To. Validation order: table, correction rules
+// (manager, reason, actor), no_show grace,
 // completed sale ref, then late-cancel flagging. On error the input
 // appointment is returned unchanged with a zero Event.
 func Transition(a Appointment, in TransitionInput, p Policy, ids IDGen) (Appointment, Event, error) {
@@ -38,6 +50,19 @@ func Transition(a Appointment, in TransitionInput, p Policy, ids IDGen) (Appoint
 		return a, Event{}, ErrTransitionNotAllowed
 	}
 	out := a
+	reason := ""
+	if (a.State == NoShow && in.To == CheckedIn) || (a.State == InService && in.To == CancelledByShop) {
+		if a.State == NoShow && !in.ByManager {
+			return a, Event{}, ErrOverrideNotAllowed
+		}
+		reason = strings.TrimSpace(in.Reason)
+		if reason == "" {
+			return a, Event{}, ErrReasonRequired
+		}
+		if utf8.RuneCountInString(reason) > MaxOverrideReasonRunes || in.ActorUserID == "" {
+			return a, Event{}, ErrInvalid
+		}
+	}
 	switch in.To {
 	case NoShow:
 		if p.NoShowGraceMin < 0 {
@@ -61,7 +86,7 @@ func Transition(a Appointment, in TransitionInput, p Policy, ids IDGen) (Appoint
 	}
 	out.State = in.To
 	ev := Event{ID: ids(), AppointmentID: a.ID, ActorUserID: in.ActorUserID, At: in.Now,
-		Kind: KindStateChange, FromState: a.State, ToState: in.To}
+		Kind: KindStateChange, FromState: a.State, ToState: in.To, Reason: reason}
 	return out, ev, nil
 }
 

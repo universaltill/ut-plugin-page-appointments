@@ -133,7 +133,7 @@ func TestConflict_OverrideRefused(t *testing.T) {
 			t.Errorf("%s: %v %+v", tc.name, err, r)
 		}
 	}
-	ok := Override{ByManager: true, Reason: strings.Repeat("é", 500)}
+	ok := Override{ByManager: true, Reason: strings.Repeat("é", 500), ActorUserID: "u1"}
 	if _, err := CheckConflict(c, ex, overridePolicy(), &ok, fakeClock{jan14(t, 8, 0)}, counterIDs("ev")); err != nil {
 		t.Fatal("500 runes should pass")
 	}

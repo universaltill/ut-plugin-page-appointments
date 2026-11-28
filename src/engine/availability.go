@@ -63,6 +63,14 @@ func (r Request) eligible(resID string) bool {
 // service, resource not eligible; an inactive resource yields no slots.
 func Availability(loc *time.Location, day Date, res Resource, req Request,
 	existing []Appointment, p Policy, now time.Time) ([]Slot, error) {
+	return AvailabilityExcluding(loc, day, res, req, existing, "", p, now)
+}
+
+// AvailabilityExcluding is Availability for moving an existing appointment:
+// the row named excludeID does not hold time, so its own slot and a small
+// shift of it are offered (F13). An empty excludeID excludes nothing.
+func AvailabilityExcluding(loc *time.Location, day Date, res Resource, req Request,
+	existing []Appointment, excludeID string, p Policy, now time.Time) ([]Slot, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
@@ -73,7 +81,22 @@ func Availability(loc *time.Location, day Date, res Resource, req Request,
 	if !req.eligible(res.ID) {
 		return nil, ErrResourceNotEligible
 	}
-	return slotsFor(loc, day, res, dur, buf, existing, p, now), nil
+	return slotsFor(loc, day, res, dur, buf, holdable(existing, excludeID), p, now), nil
+}
+
+// holdable is Current(existing) without the row named excludeID.
+func holdable(existing []Appointment, excludeID string) []Appointment {
+	cur := Current(existing)
+	if excludeID == "" {
+		return cur
+	}
+	out := cur[:0:0]
+	for _, a := range cur {
+		if a.ID != excludeID {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func slotsFor(loc *time.Location, day Date, res Resource, dur, buf int,
@@ -117,6 +140,13 @@ func slotsFor(loc *time.Location, day Date, res Resource, dur, buf int,
 // by start then resource id.
 func AvailabilityAny(loc *time.Location, day Date, resources []Resource, req Request,
 	existing []Appointment, p Policy, now time.Time) ([]Slot, error) {
+	return AvailabilityAnyExcluding(loc, day, resources, req, existing, "", p, now)
+}
+
+// AvailabilityAnyExcluding is AvailabilityAny with the row excludeID not
+// holding time (see AvailabilityExcluding).
+func AvailabilityAnyExcluding(loc *time.Location, day Date, resources []Resource, req Request,
+	existing []Appointment, excludeID string, p Policy, now time.Time) ([]Slot, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
@@ -125,11 +155,12 @@ func AvailabilityAny(loc *time.Location, day Date, resources []Resource, req Req
 		return nil, err
 	}
 	out := []Slot{}
+	holds := holdable(existing, excludeID)
 	for _, r := range resources {
 		if !req.eligible(r.ID) {
 			continue
 		}
-		out = append(out, slotsFor(loc, day, r, dur, buf, existing, p, now)...)
+		out = append(out, slotsFor(loc, day, r, dur, buf, holds, p, now)...)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if !out[i].Start.Equal(out[j].Start) {
