@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,8 @@ type Repository struct {
 	ids    engine.IDGen
 	tillID string
 	mu     sync.Mutex
+	// pageSize is the keyset page of Purge and Reconcile (0 = DefaultPageSize).
+	pageSize int
 }
 
 // New returns a Repository. tillID is the origin till of new bookings.
@@ -393,7 +396,8 @@ func (r *Repository) Create(ctx context.Context, nb NewBooking) (Booking, error)
 		return Booking{}, err
 	}
 	now := r.clock.Now()
-	if a.ID == "" {
+	provided := a.ID != ""
+	if !provided {
 		a.ID = r.ids()
 	}
 	a.Source, a.OriginTillID, a.SupersedesID = "own", r.tillID, ""
@@ -414,7 +418,55 @@ func (r *Repository) Create(ctx context.Context, nb NewBooking) (Booking, error)
 			Kind: engine.KindStateChange, ToState: engine.Booked}
 	}
 	b := Booking{Appointment: a, FirstName: name, Currency: set.Currency}
+	if provided {
+		if existing, found, err := r.existingForCreate(ctx, b); err != nil || found {
+			return existing, err
+		}
+	}
 	return r.insertChecked(ctx, b, set, nb.Override, created)
+}
+
+// existingForCreate handles a caller-supplied id (a retry after a lost
+// answer). If the appointment exists and the request describes the same
+// booking, that booking comes back and nothing is written; if it differs,
+// ErrIDExists. Lines left behind by a crash before the appointment row (no
+// row, only lines) must equal the new lines, else ErrIDExists: lines of an
+// immutable booking are never added to. The caller holds r.mu.
+func (r *Repository) existingForCreate(ctx context.Context, b Booking) (Booking, bool, error) {
+	cur, err := r.get(ctx, b.ID)
+	switch {
+	case err == nil:
+		if cur.ResourceID == b.ResourceID && cur.Start.Equal(b.Start) && cur.End.Equal(b.End) &&
+			cur.BufferMin == b.BufferMin && cur.WalkIn == b.WalkIn && sameLines(cur.Lines, b.Lines) {
+			return cur, true, nil
+		}
+		return Booking{}, false, ErrIDExists
+	case errors.Is(err, ErrNotFound):
+	default:
+		return Booking{}, false, err
+	}
+	orphan := Booking{Appointment: engine.Appointment{ID: b.ID}}
+	if err := r.loadLines(ctx, &orphan); err != nil {
+		return Booking{}, false, err
+	}
+	if len(orphan.Lines) > 0 && !sameLines(orphan.Lines, b.Lines) {
+		return Booking{}, false, ErrIDExists
+	}
+	return Booking{}, false, nil
+}
+
+func sameLines(a, b []engine.Line) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, y := a[i], b[i]
+		if x.SKU != y.SKU || x.Name != y.Name || x.Qty != y.Qty || x.Amount.Minor() != y.Amount.Minor() ||
+			x.DurationMin != y.DurationMin || x.BufferMin != y.BufferMin {
+			return false
+		}
+	}
+	return true
 }
 
 // insertChecked runs the conflict check against the stored current rows and
@@ -516,6 +568,26 @@ func (r *Repository) Transition(ctx context.Context, id string, in engine.Transi
 	if err != nil {
 		return Booking{}, err
 	}
+	events := []engine.Event{ev}
+	if b.State == engine.NoShow && in.To == engine.CheckedIn {
+		// The chair is held again. The manager's correction is always allowed
+		// (a mistake must be undoable); an overlap with a booking that took
+		// the slot meanwhile is recorded as a conflict_override event with the
+		// manager's reason, whatever the double-booking setting (the engine
+		// already required the manager, the reason and the actor).
+		existing, err := r.listCurrent(ctx, out.Start, out.End.Add(time.Duration(out.BufferMin)*time.Minute), out.ResourceID)
+		if err != nil {
+			return Booking{}, err
+		}
+		pol := set.Policy
+		pol.AllowDoubleBooking = true
+		ov := &engine.Override{ByManager: true, Reason: ev.Reason, ActorUserID: in.ActorUserID}
+		res, err := engine.CheckConflict(out, appointments(existing), pol, ov, r.clock, r.ids)
+		if err != nil {
+			return Booking{}, err
+		}
+		events = append(events, res.Events...)
+	}
 	n, err := r.db.Exec(ctx, SQLSetProjection, id, string(out.State), b2i(out.LateCancel), out.SaleRef, string(b.State))
 	if err != nil {
 		return Booking{}, err
@@ -523,8 +595,10 @@ func (r *Repository) Transition(ctx context.Context, id string, in engine.Transi
 	if n == 0 {
 		return Booking{}, ErrStale
 	}
-	if err := r.insertEvent(ctx, ev); err != nil {
-		return Booking{}, err
+	for _, e := range events {
+		if err := r.insertEvent(ctx, e); err != nil {
+			return Booking{}, err
+		}
 	}
 	b.Appointment = out
 	return b, nil
@@ -643,25 +717,30 @@ func (r *Repository) Events(ctx context.Context, id string) ([]engine.Event, err
 
 // Reconcile repairs a state projection that disagrees with the last event of
 // its row (a crash between the two writes of Transition): it appends the
-// missing event. It returns how many rows were repaired.
+// missing event. "Last" is insert order, not the wall clock, so a clock that
+// stepped back never causes a repair. It reads the stale rows a page at a
+// time (host result cap) and returns how many rows were repaired.
 func (r *Repository) Reconcile(ctx context.Context) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rows, err := query(ctx, r.db, SQLStaleProjection)
-	if err != nil {
-		return 0, err
-	}
 	n := 0
-	for _, w := range rows {
-		if w.str("state") == w.str("last_state") {
-			continue
-		}
-		ev := engine.Event{ID: r.ids(), AppointmentID: w.str("id"), At: r.clock.Now(), Kind: engine.KindStateChange,
-			FromState: engine.State(w.str("last_state")), ToState: engine.State(w.str("state")), Reason: ReasonReconcile}
-		if err := r.insertEvent(ctx, ev); err != nil {
+	after := ""
+	for {
+		rows, err := query(ctx, r.db, SQLStaleProjection, after, r.page())
+		if err != nil {
 			return n, err
 		}
-		n++
+		for _, w := range rows {
+			after = w.str("id")
+			ev := engine.Event{ID: r.ids(), AppointmentID: after, At: r.clock.Now(), Kind: engine.KindStateChange,
+				FromState: engine.State(w.str("last_state")), ToState: engine.State(w.str("state")), Reason: ReasonReconcile}
+			if err := r.insertEvent(ctx, ev); err != nil {
+				return n, err
+			}
+			n++
+		}
+		if len(rows) < r.page() {
+			return n, nil
+		}
 	}
-	return n, nil
 }

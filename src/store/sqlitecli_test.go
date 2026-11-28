@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -19,9 +20,18 @@ type cliDB struct {
 	path string
 }
 
+// sqliteRequired is true on CI and when REQUIRE_SQLITE=1: the real-SQLite
+// subtests (migrations, triggers, purge) must never vanish silently.
+func sqliteRequired() bool {
+	return os.Getenv("CI") == "true" || os.Getenv("REQUIRE_SQLITE") == "1"
+}
+
 func newCLIDB(t testing.TB) *cliDB {
 	t.Helper()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
+		if sqliteRequired() {
+			t.Fatal("sqlite3 command not installed, but CI=true or REQUIRE_SQLITE=1 demands it")
+		}
 		t.Skip("sqlite3 command not installed")
 	}
 	return &cliDB{t: t, path: filepath.Join(t.TempDir(), "plugin.db")}

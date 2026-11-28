@@ -640,3 +640,43 @@ func TestErrorKey(t *testing.T) {
 		t.Fatal("generic")
 	}
 }
+
+// N2: with CanAdmin unset the handler fails closed for a non-manager role.
+func TestAdmin_DefaultCheckFailsClosed(t *testing.T) {
+	h, repo := newHandler(t) // CanAdmin is nil
+	for _, role := range []string{"cashier", "", "viewer"} {
+		r, _ := h.HandleAction(ctx, admin.ActionRequest{View: admin.ViewResources, Action: admin.ActSaveResource, Operator: &admin.Operator{Role: role},
+			Form: map[string]any{"name": "X", "kind": "staff"}})
+		wantNotice(t, *r.Document, "error", "appointments.admin.error.forbidden")
+		rv, _ := h.HandleView(ctx, admin.ViewRequest{View: admin.ViewSettings, Operator: &admin.Operator{Role: role}})
+		wantNotice(t, *rv.Document, "error", "appointments.admin.error.forbidden")
+	}
+	if rs, _ := repo.Resources(ctx); len(rs) != 0 {
+		t.Fatal("a forbidden action wrote data")
+	}
+	for _, op := range []*admin.Operator{nil, {Role: "manager"}, {Role: "admin"}, {Role: "owner"}} {
+		rv, _ := h.HandleView(ctx, admin.ViewRequest{View: admin.ViewSettings, Operator: op})
+		if _, bad := firstNotice(*rv.Document); bad {
+			t.Fatalf("refused %+v", op)
+		}
+	}
+}
+
+// N10 / N12: the texts claim only what is true until a purge trigger and a
+// completion path exist.
+func TestLocale_NoClaimsWithoutAPath(t *testing.T) {
+	raw, err := os.ReadFile("../../locales/en.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var en map[string]string
+	if err := json.Unmarshal(raw, &en); err != nil {
+		t.Fatal(err)
+	}
+	if v := en["appointments.admin.settings.privacy"]; strings.Contains(v, "automatically") {
+		t.Fatalf("privacy text claims automatic blanking: %q", v)
+	}
+	if v := en["appt.cal.complete_at_till"]; strings.Contains(v, "at the till") {
+		t.Fatalf("completion text promises a path that does not exist: %q", v)
+	}
+}

@@ -276,21 +276,42 @@ func (d *DB) Query(_ context.Context, q string, a ...any) ([]byte, error) {
 				m = append(m, r)
 			}
 		}
-		rows = project(sorted(m, sortKeys("at")), "id", "appointment_id", "at", "actor_user_id", "kind", "from_state", "to_state", "reason", "conflicting_ids")
-	case store.SQLChainInfo:
+		rows = project(m, "id", "appointment_id", "at", "actor_user_id", "kind", "from_state", "to_state", "reason", "conflicting_ids")
+	case store.SQLNamedPage:
+		after, limit := asStr(a[0]), int(asInt(a[1]))
 		for _, r := range sorted(d.tables["appointments"], sortKeys("id")) {
-			rows = append(rows, rec{"id": r["id"], "supersedes_id": r["supersedes_id"], "state": r["state"], "end_utc": r["end_utc"],
-				"named": asInt(r["client_first_name"] != "")})
+			if len(rows) >= limit {
+				break
+			}
+			if r["client_first_name"] != "" && r["id"].(string) > after {
+				rows = append(rows, rec{"id": r["id"]})
+			}
+		}
+	case store.SQLChainRow:
+		for _, r := range d.tables["appointments"] {
+			if r["id"] == a[0] {
+				rows = []rec{{"id": r["id"], "supersedes_id": r["supersedes_id"], "state": r["state"], "end_utc": r["end_utc"],
+					"named": asInt(r["client_first_name"] != "")}}
+			}
 		}
 	case store.SQLStaleProjection:
+		after, limit := asStr(a[0]), int(asInt(a[1]))
 		for _, r := range sorted(d.tables["appointments"], sortKeys("id")) {
+			if len(rows) >= limit {
+				break
+			}
+			if r["id"].(string) <= after {
+				continue
+			}
 			last := ""
-			for _, e := range sorted(d.tables["appointment_events"], sortKeys("at")) {
+			for _, e := range d.tables["appointment_events"] { // insertion order = rowid
 				if e["appointment_id"] == r["id"] {
 					last = e["to_state"].(string)
 				}
 			}
-			rows = append(rows, rec{"id": r["id"], "state": r["state"], "last_state": last})
+			if r["state"] != last {
+				rows = append(rows, rec{"id": r["id"], "state": r["state"], "last_state": last})
+			}
 		}
 	default:
 		return nil, fmt.Errorf("memdb: unknown statement %q", q)

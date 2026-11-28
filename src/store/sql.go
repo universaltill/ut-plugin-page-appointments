@@ -37,12 +37,19 @@ const (
 	// (an optimistic check: 0 rows affected means someone else moved it).
 	SQLSetProjection = `UPDATE appointments SET state = ?2, late_cancel = ?3, sale_ref = ?4 WHERE id = ?1 AND state = ?5`
 	SQLInsertEvent   = `INSERT INTO appointment_events (id, appointment_id, at, actor_user_id, kind, from_state, to_state, reason, conflicting_ids) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`
-	SQLListEvents    = `SELECT id, appointment_id, at, actor_user_id, kind, from_state, to_state, reason, conflicting_ids FROM appointment_events WHERE appointment_id = ?1 ORDER BY at, rowid`
+	SQLListEvents    = `SELECT id, appointment_id, at, actor_user_id, kind, from_state, to_state, reason, conflicting_ids FROM appointment_events WHERE appointment_id = ?1 ORDER BY rowid`
 
-	// SQLChainInfo lists every appointment row with what the purge needs.
-	SQLChainInfo = `SELECT id, supersedes_id, state, end_utc, client_first_name <> '' AS named FROM appointments ORDER BY id`
+	// The purge, erasure and reconcile statements never read the table in one
+	// result: the host caps a result at 1 MiB (plugindb MaxResultBytes). They
+	// page by keyset (id > ?1 LIMIT ?2) and select only what they need.
+	//
+	// SQLNamedPage lists the ids of rows that still carry a first name.
+	SQLNamedPage = `SELECT id FROM appointments WHERE client_first_name <> '' AND id > ?1 ORDER BY id LIMIT ?2`
+	// SQLChainRow reads what the purge needs of one row.
+	SQLChainRow  = `SELECT id, supersedes_id, state, end_utc, client_first_name <> '' AS named FROM appointments WHERE id = ?1`
 	SQLBlankName = `UPDATE appointments SET client_first_name = '' WHERE id = ?1 AND client_first_name <> ''`
-	// SQLStaleProjection lists rows whose state projection differs from the
-	// to_state of their last event (or that have no event).
-	SQLStaleProjection = `SELECT a.id AS id, a.state AS state, COALESCE((SELECT e.to_state FROM appointment_events e WHERE e.appointment_id = a.id ORDER BY e.at DESC, e.rowid DESC LIMIT 1), '') AS last_state FROM appointments a ORDER BY a.id`
+	// SQLStaleProjection lists, a page at a time, rows whose state projection
+	// differs from the to_state of their last event (or that have no event).
+	// "Last" is insert order (rowid), never the wall clock, which can step back.
+	SQLStaleProjection = `SELECT a.id AS id, a.state AS state, COALESCE((SELECT e.to_state FROM appointment_events e WHERE e.appointment_id = a.id ORDER BY e.rowid DESC LIMIT 1), '') AS last_state FROM appointments a WHERE a.id > ?1 AND a.state <> COALESCE((SELECT e.to_state FROM appointment_events e WHERE e.appointment_id = a.id ORDER BY e.rowid DESC LIMIT 1), '') ORDER BY a.id LIMIT ?2`
 )

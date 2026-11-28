@@ -210,7 +210,7 @@ func TestValidateFirstName(t *testing.T) {
 	cases := map[string]error{
 		strings.Repeat("a", 41): store.ErrNameTooLong, strings.Repeat("é", 41): store.ErrNameTooLong,
 		"Ann1": store.ErrNameChars, "07700900123": store.ErrNameChars, "a@b": store.ErrNameChars, "@": store.ErrNameChars,
-		"٣": store.ErrNameChars, "²": store.ErrNameChars,
+		"٣": store.ErrNameChars, "²": store.ErrNameChars, "bad\xffbyte": store.ErrNameChars,
 	}
 	for s, want := range cases {
 		if _, err := store.ValidateFirstName(s); !errors.Is(err, want) {

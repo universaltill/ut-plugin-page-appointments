@@ -65,9 +65,38 @@ func backends() []backend {
 }
 
 func forEachBackend(t *testing.T, fn func(t *testing.T, e *env)) {
+	forEachBackendWith(t, nil, fn)
+}
+
+// hostMaxResultBytes mirrors the host's plugindb MaxResultBytes (1 MiB): a
+// query whose JSON result is larger fails with ErrResultTooLarge.
+const hostMaxResultBytes = 1 << 20
+
+// capDB enforces a result cap like the host's plugindb does.
+type capDB struct {
+	store.DB
+	max int
+}
+
+func (c capDB) Query(ctx context.Context, q string, args ...any) ([]byte, error) {
+	b, err := c.DB.Query(ctx, q, args...)
+	if err == nil && len(b) > c.max {
+		return nil, fmt.Errorf("plugindb: result too large (%d > %d bytes)", len(b), c.max)
+	}
+	return b, err
+}
+
+func capped(max int) func(store.DB) store.DB {
+	return func(d store.DB) store.DB { return capDB{DB: d, max: max} }
+}
+
+func forEachBackendWith(t *testing.T, wrap func(store.DB) store.DB, fn func(t *testing.T, e *env)) {
 	for _, b := range backends() {
 		t.Run(b.name, func(t *testing.T) {
 			db, dump := b.make(t)
+			if wrap != nil {
+				db = wrap(db)
+			}
 			clk := &clock{t: at(14, 8, 0)}
 			fn(t, &env{repo: store.New(db, clk, counter("id"), "till1"), clk: clk, db: db, dump: dump})
 		})

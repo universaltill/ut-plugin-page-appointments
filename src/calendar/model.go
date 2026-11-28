@@ -44,7 +44,12 @@ type Queued struct {
 	ServiceSKU string
 }
 
-// Change is one atomic write. The real store applies it in a transaction.
+// Change is one write the calendar needs to be atomic. Nothing implements it
+// yet. The host refuses BEGIN/COMMIT for a guest and runs one statement per
+// call, so a store adapter cannot use a transaction: it must order the writes
+// (as store.Repository does) so that a crash leaves either nothing visible or
+// a state a reconcile repairs, for example seating a walk-in (Insert +
+// Dequeue) or a move (Insert + Superseded). That adapter needs its own card.
 type Change struct {
 	// Insert is a new appointment row (booking, walk-in, replacement row).
 	Insert *Booking
@@ -60,8 +65,10 @@ type Change struct {
 	Enqueue *Queued
 }
 
-// Store is what the calendar needs from persistence (#7113 implements it; the
-// guest database seam is ut-docs#3157). Bookings returns the current rows
+// Store is what the calendar needs from persistence. It has no implementation
+// yet: store.Repository has different methods and the schema has no walk-in
+// queue table, so an adapter (with the queue table and a crash-safe write
+// order) is a separate card. The guest database seam is ut-docs#3157. Bookings returns the current rows
 // (never superseded ones, any state) that overlap [from, to).
 type Store interface {
 	Shop() (Shop, error)

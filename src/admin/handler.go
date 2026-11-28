@@ -57,8 +57,9 @@ type Handler struct {
 	Repo   *store.Repository
 	NewID  engine.IDGen
 	Prices PriceLookup // optional; nil shows no price
-	// CanAdmin decides whether the operator may use the admin pages; nil
-	// allows everyone (the till sends no operator when sign-in is off).
+	// CanAdmin decides whether the operator may use the admin pages. When it
+	// is nil the handler fails closed with DefaultCanAdmin: no operator
+	// (sign-in off) or a manager, admin or owner role.
 	CanAdmin func(*Operator) bool
 }
 
@@ -94,7 +95,26 @@ func ErrorKeys() []string {
 	return out
 }
 
-func (h *Handler) allowed(op *Operator) bool { return h.CanAdmin == nil || h.CanAdmin(op) }
+// DefaultCanAdmin is the check used when CanAdmin is unset, the same rule as
+// calendar.Operator.IsManager: a missing operator (the till sends none when
+// sign-in is off) or the role manager, admin or owner.
+func DefaultCanAdmin(op *Operator) bool {
+	if op == nil {
+		return true
+	}
+	switch op.Role {
+	case "manager", "admin", "owner":
+		return true
+	}
+	return false
+}
+
+func (h *Handler) allowed(op *Operator) bool {
+	if h.CanAdmin == nil {
+		return DefaultCanAdmin(op)
+	}
+	return h.CanAdmin(op)
+}
 
 // HandleView answers a GET.
 func (h *Handler) HandleView(ctx context.Context, req ViewRequest) (Response, error) {

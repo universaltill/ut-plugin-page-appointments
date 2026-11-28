@@ -204,20 +204,21 @@ func (e *env) do(a Ask, v verb, b Booking) (*Document, error) {
 	}
 	events := []engine.Event{ev}
 	if b.State == engine.NoShow && v.to == engine.CheckedIn {
-		// The chair is held again: the corrected booking must not overlap one
-		// that took the slot meanwhile, unless the shop allows double booking
-		// and the manager's reason stands as the override reason.
+		// The chair is held again. The correction is always allowed for a
+		// manager (a mistake must be undoable); an overlap with a booking that
+		// took the slot meanwhile is written as a conflict_override event with
+		// the manager's reason, whatever the double-booking setting. The same
+		// rule as store.Repository.Transition.
 		from, to := e.bounds(day)
 		around, err := e.deps.Store.Bookings(from.Add(-24*time.Hour), to.Add(24*time.Hour))
 		if err != nil {
 			return nil, err
 		}
+		pol := e.policy
+		pol.AllowDoubleBooking = true
 		ov := &engine.Override{ByManager: true, Reason: in.Reason, ActorUserID: in.ActorUserID}
-		res, err := engine.CheckConflict(next, engineAppts(around), e.policy, ov, clockAt{e.now}, e.deps.IDs)
+		res, err := engine.CheckConflict(next, engineAppts(around), pol, ov, clockAt{e.now}, e.deps.IDs)
 		if err != nil {
-			if errors.Is(err, engine.ErrOverrideNotAllowed) {
-				return e.detail(b, notice("error", e.t.lit("appt.cal.overlap", e.overlapNames(res.ConflictingIDs, around)))), nil
-			}
 			return fail(err)
 		}
 		events = append(events, res.Events...)

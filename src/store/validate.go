@@ -35,6 +35,7 @@ var (
 	ErrStale           = errors.New("stale")
 	ErrDepositReserved = errors.New("deposit_reserved")
 	ErrInvalidInput    = errors.New("invalid_input")
+	ErrIDExists        = errors.New("id_exists")
 )
 
 // ValidateFirstName trims the name and checks it: at most 40 characters, no
@@ -46,7 +47,7 @@ func ValidateFirstName(s string) (string, error) {
 		return "", ErrNameTooLong
 	}
 	for _, r := range s {
-		if r == '@' || unicode.IsDigit(r) || unicode.IsNumber(r) || unicode.IsControl(r) {
+		if r == '@' || unicode.IsDigit(r) || unicode.IsNumber(r) || unicode.IsControl(r) || r == utf8.RuneError {
 			return "", ErrNameChars
 		}
 	}

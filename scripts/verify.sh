@@ -3,6 +3,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+echo "==> sqlite3"
+# The store tests run against a real SQLite through the sqlite3 CLI; without it
+# they would be skipped silently (migrations, triggers, purge).
+command -v sqlite3 >/dev/null || { echo "sqlite3 is not installed: the real-SQLite store tests need it" >&2; exit 1; }
+
 echo "==> gofmt"
 fmt_out=$(gofmt -l .)
 if [ -n "$fmt_out" ]; then echo "gofmt found unformatted files:" >&2; echo "$fmt_out" >&2; exit 1; fi

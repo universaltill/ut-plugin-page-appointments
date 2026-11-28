@@ -314,7 +314,7 @@ func TestTransitions_CheckInAndStart(t *testing.T) {
 	// stale button: checking in an in-service booking is refused with a reason
 	ans := run(t, d, ask("do_checkin_a", now, cashier, nil))
 	has(t, ans.Document, "cannot be done in the booking's current state")
-	has(t, ans.Document, "Complete this visit at the till")
+	has(t, ans.Document, "cannot be completed from this page yet")
 }
 
 func TestTransitions_UndoCheckIn(t *testing.T) {
@@ -422,16 +422,15 @@ func TestTransitions_UndoNoShowAfterWalkInTookTheChair(t *testing.T) {
 		return f, newDeps(f)
 	}
 	now := jan14(t, 10, 25)
-	f, d := setup(false)
-	ans := run(t, d, ask("do_unns_a", now, manager, map[string]any{"reason": "arrived"}))
-	has(t, ans.Document, "That time overlaps: 10:20-10:50 Wes")
-	if f.rows["a"].State != engine.NoShow || len(f.events) != 0 {
-		t.Fatal("undo wrote over a walk-in")
-	}
-	f, d = setup(true)
-	run(t, d, ask("do_unns_a", now, manager, map[string]any{"reason": "arrived"}))
-	if f.rows["a"].State != engine.CheckedIn || len(f.events) != 2 || f.events[1].Kind != engine.KindConflictOverride {
-		t.Fatalf("%v %+v", f.rows["a"].State, f.events)
+	// N1: the correction is always allowed for a manager; the overlap is
+	// written as a conflict_override event, whatever the double-booking setting.
+	for _, allow := range []bool{false, true} {
+		f, d := setup(allow)
+		run(t, d, ask("do_unns_a", now, manager, map[string]any{"reason": "arrived"}))
+		if f.rows["a"].State != engine.CheckedIn || len(f.events) != 2 || f.events[1].Kind != engine.KindConflictOverride ||
+			f.events[1].Reason != "arrived" {
+			t.Fatalf("allow=%v: %v %+v", allow, f.rows["a"].State, f.events)
+		}
 	}
 }
 

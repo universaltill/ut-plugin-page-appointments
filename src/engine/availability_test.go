@@ -387,3 +387,16 @@ func TestAvailability_Property(t *testing.T) {
 		}
 	}
 }
+
+// A slot that overshoots the working window by less than one step is refused:
+// 17 minutes on a 15 minute grid in 09:00-10:00 cannot start at 09:45.
+func TestAvailability_SlotOvershootingWindowByLessThanAStep(t *testing.T) {
+	for _, dur := range []int{17, 25} {
+		s := avail(t, res("r1", 540, 600), req(dur, 0), nil, jan14(t, 8, 0))
+		got := hm(s, time.UTC)
+		want := []string{"09:00", "09:15", "09:30"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("dur %d: got %v want %v", dur, got, want)
+		}
+	}
+}

@@ -23,6 +23,8 @@ func TestCleanName(t *testing.T) {
 		{"Anna 2", false, "", ErrNameInvalid},
 		{"Anna 07700 900123", false, "", ErrNameInvalid},
 		{"٣ Anna", false, "", ErrNameInvalid}, // Arabic-indic digit
+		{"Anna²", false, "", ErrNameInvalid},  // N7: same rule as the store
+		{"AnnaⅧ", false, "", ErrNameInvalid},
 		{"anna@x.com", false, "", ErrNameInvalid},
 		{"Anna\nSmith", false, "", ErrNameInvalid},
 		{"bad\xffbyte", false, "", ErrNameInvalid},
