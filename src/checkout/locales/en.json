@@ -1,0 +1,9 @@
+{
+  "appointments.checkout.not_checkout_state": "Only a checked-in or in-service appointment can be checked out.",
+  "appointments.checkout.not_own_appointment": "This booking belongs to a booking provider and is checked out there.",
+  "appointments.checkout.no_lines": "This appointment has no services to check out.",
+  "appointments.checkout.receipt_not_paid": "That receipt is not a paid sale.",
+  "appointments.checkout.unknown_appointment": "Appointment not found.",
+  "appointments.checkout.incomplete": "Not every service was on the sale. Complete the appointment by picking the receipt.",
+  "appointments.checkout.other_sale": "This appointment was already completed by a different sale."
+}
