@@ -225,7 +225,10 @@ func (e *env) do(a Ask, v verb, b Booking) (*Document, error) {
 		events = append(events, res.Events...)
 	}
 	nb := Booking{Appointment: next, FirstName: b.FirstName}
-	if err := e.deps.Store.Commit(Change{Update: &nb, Events: events}); err != nil {
+	if err := e.deps.Store.Commit(Change{Update: &nb, From: b.State, Events: events}); err != nil {
+		if errors.Is(err, ErrGone) { // moved by another event since it was read
+			return e.dayDocument(day, e.errNotice(errGone))
+		}
 		return nil, err
 	}
 	msg := notice("info", e.t.lit("appt.cal.done", e.t.s(v.label), e.clientName(b)))

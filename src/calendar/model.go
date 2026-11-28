@@ -59,6 +59,11 @@ type Change struct {
 	// Update replaces the projected state (and LateCancel/SaleRef) of an
 	// existing row. Booking data never changes in place.
 	Update *Booking
+	// From is the state the decision behind Update was made on. The write is
+	// guarded on it (UPDATE ... WHERE state = From): if another event moved
+	// the row meanwhile, Commit returns ErrGone and nothing changes. An
+	// Update without From is refused.
+	From engine.State
 	// Events are appended to the audit log, in order.
 	Events []engine.Event
 	// Dequeue removes a queued walk-in; Enqueue adds one.

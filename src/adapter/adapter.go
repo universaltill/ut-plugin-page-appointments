@@ -10,8 +10,9 @@
 //     leaves a booking with missing events (store.Reconcile repairs it) and,
 //     for a seated walk-in, a queue entry the queue never lists because its id
 //     is an appointment id.
-//   - update: the state projection moves first with an optimistic check
-//     (a stale post is refused), then the events.
+//   - update: the state projection moves first, guarded on the state the
+//     caller decided on (Change.From; UPDATE ... WHERE state = From, 0 rows
+//     = refused), then the events.
 //
 // A row that is superseded, missing or already moved is calendar.ErrGone.
 package adapter
@@ -58,6 +59,8 @@ func (s *Store) ctx() context.Context {
 	}
 	return s.Ctx
 }
+
+var errNoFrom = errors.New("adapter: update without the decided-on state")
 
 func gone(err error) error {
 	if errors.Is(err, store.ErrNotCurrent) || errors.Is(err, store.ErrStale) || errors.Is(err, store.ErrNotFound) {
@@ -206,11 +209,12 @@ func (s *Store) Commit(ch calendar.Change) error {
 		}
 		return nil
 	case ch.Update != nil:
-		cur, err := s.Repo.Get(ctx, ch.Update.ID)
-		if err != nil {
-			return gone(err)
+		if ch.From == "" {
+			return errNoFrom
 		}
-		return gone(s.Repo.SetState(ctx, ch.Update.ID, cur.State, ch.Update.Appointment, ch.Events))
+		// Guarded on the state the calendar decided on, never a fresh read: a
+		// row another event moved meanwhile is refused (ErrStale -> ErrGone).
+		return gone(s.Repo.SetState(ctx, ch.Update.ID, ch.From, ch.Update.Appointment, ch.Events))
 	case ch.Enqueue != nil:
 		w := ch.Enqueue
 		return s.Repo.Enqueue(ctx, store.QueueEntry{ID: w.ID, Seq: w.Seq, Arrived: w.Arrived, FirstName: w.FirstName,

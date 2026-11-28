@@ -32,6 +32,9 @@ var (
 	ErrBadLine            = errors.New("bad_line")
 	ErrReceiptNotPaid     = errors.New("receipt_not_paid")
 	ErrUnknownAppointment = errors.New("unknown_appointment")
+	// ErrConflict: the appointment moved between the decision and the write
+	// (another event completed or changed it); nothing was written.
+	ErrConflict = errors.New("completion_conflict")
 )
 
 const refPrefix = "appt:"
@@ -117,15 +120,19 @@ type Completion struct {
 	Published     bool
 }
 
-// Store is the persistence the host provides. Commit must write the
-// appointment state, its events and the outbox record in one transaction.
+// Store is the persistence the host provides. The host has no transaction:
+// Commit writes the appointment state (the commit point), then its events,
+// then the outbox record, in that order, so a crash leaves at worst a
+// completed row without an outbox row, which Pending rebuilds. The state write
+// is guarded on from (the state the completion was decided on): if the row is
+// no longer in that state Commit returns ErrConflict and writes nothing.
 type Store interface {
 	Appointment(id string) (engine.Appointment, bool, error)
 	// Currency is the ISO code stored on the appointment record (appointment-v1:
 	// stored so that a later currency change never mixes amounts). The completed
 	// event is published under it, never under a processor-wide setting.
 	Currency(id string) (string, error)
-	Commit(a engine.Appointment, evs []engine.Event, c Completion) error
+	Commit(from engine.State, a engine.Appointment, evs []engine.Event, c Completion) error
 	Pending() ([]Completion, error)
 	MarkPublished(appointmentID string) error
 }
@@ -310,7 +317,8 @@ func (p *Processor) complete(id, saleID, actor string, lines map[int]bool) (Resu
 }
 
 // finish runs checked_in -> in_service (if needed) -> completed through the
-// engine, freezes the payload and commits everything in one Store.Commit.
+// engine, freezes the payload and commits it with one Store.Commit (ordered
+// writes, guarded on the state a was read in).
 func (p *Processor) finish(a engine.Appointment, saleID, actor string) (Result, error) {
 	now := p.Clock.Now()
 	var evs []engine.Event
@@ -339,7 +347,15 @@ func (p *Processor) finish(a engine.Appointment, saleID, actor string) (Result, 
 	if err != nil {
 		return Result{}, err
 	}
-	if err := p.Store.Commit(n, evs, Completion{AppointmentID: n.ID, SaleRef: saleID, Payload: payload}); err != nil {
+	if err := p.Store.Commit(a.State, n, evs, Completion{AppointmentID: n.ID, SaleRef: saleID, Payload: payload}); err != nil {
+		if errors.Is(err, ErrConflict) {
+			// Another event got there first: report what it did.
+			if now, ok, rerr := p.Store.Appointment(a.ID); rerr == nil && ok {
+				if r, done := settled(now, saleID); done {
+					return r, nil
+				}
+			}
+		}
 		return Result{}, err
 	}
 	return Result{AppointmentID: n.ID, Outcome: Completed}, nil

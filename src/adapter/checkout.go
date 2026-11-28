@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/universaltill/ut-plugin-page-appointments/src/calendar"
 	"github.com/universaltill/ut-plugin-page-appointments/src/checkout"
@@ -13,7 +14,8 @@ import (
 // Checkout is checkout.Store on the repository. The host has no transaction,
 // so the three writes of one completion are ordered, not atomic:
 //
-//  1. the state projection moves to completed (the commit point, optimistic),
+//  1. the state projection moves to completed (the commit point, guarded on
+//     the state the processor decided on),
 //  2. the events are appended,
 //  3. the frozen payload goes to the outbox.
 //
@@ -59,12 +61,15 @@ func (c *Checkout) Currency(id string) (string, error) {
 }
 
 // Commit applies one completion in the order described on the type.
-func (c *Checkout) Commit(a engine.Appointment, evs []engine.Event, comp checkout.Completion) error {
-	cur, err := c.Repo.Get(c.ctx(), a.ID)
-	if err != nil {
-		return gone(err)
-	}
-	if err := c.Repo.SetState(c.ctx(), a.ID, cur.State, a, evs); err != nil {
+// The state write is guarded on from, the state the processor decided on: a
+// row another event completed (or moved) meanwhile is refused with
+// checkout.ErrConflict, so its sale_ref and its outbox row stay the first
+// completion's.
+func (c *Checkout) Commit(from engine.State, a engine.Appointment, evs []engine.Event, comp checkout.Completion) error {
+	if err := c.Repo.SetState(c.ctx(), a.ID, from, a, evs); err != nil {
+		if errors.Is(err, store.ErrStale) || errors.Is(err, store.ErrNotCurrent) {
+			return fmt.Errorf("%w: %w", checkout.ErrConflict, calendar.ErrGone)
+		}
 		return gone(err)
 	}
 	return c.Repo.InsertOutbox(c.ctx(), a.ID, comp.SaleRef, comp.Payload)
