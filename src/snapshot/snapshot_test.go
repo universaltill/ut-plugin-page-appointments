@@ -298,3 +298,59 @@ func TestChanged_7207(t *testing.T) {
 		t.Error("corrupt previous snapshot: must write")
 	}
 }
+
+// The channel caps one collection at 64 KiB (design 7207 section 3): MaxBytes
+// must never be raised past it.
+func TestMaxBytesWithinChannelCap_7207(t *testing.T) {
+	if snapshot.MaxBytes > 64*1024 {
+		t.Fatalf("MaxBytes = %d, channel cap is %d", snapshot.MaxBytes, 64*1024)
+	}
+}
+
+// Every appointment names a resource the payload carries: rows on an inactive
+// resource, or on a resource past the 20 cap, are left out (and the cap case
+// sets truncated), so the replica never draws a row on a missing `r`.
+func TestBuild_AppointmentsOnlyOnListedResources_7207(t *testing.T) {
+	in := base()
+	in.Resources = nil
+	for i := 0; i < 25; i++ {
+		in.Resources = append(in.Resources, res(fmt.Sprintf("r%02d", i), fmt.Sprintf("Staff %d", i)))
+	}
+	in.Resources[0].Active = false
+	start := utc(2026, time.November, 28, 10, 0)
+	in.Bookings = []store.Booking{
+		booking("on-inactive", "r00", start, 30, engine.Booked, "Ann"),
+		booking("on-listed", "r01", start, 30, engine.Booked, "Bea"),
+		booking("past-cap", "r24", start, 30, engine.Booked, "Cy"),
+		booking("unknown-res", "zz", start, 30, engine.Booked, "Di"),
+	}
+	raw, err := snapshot.Build(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decode(t, raw)
+	listed := map[string]bool{}
+	for _, r := range m["resources"].([]any) {
+		listed[r.(map[string]any)["id"].(string)] = true
+	}
+	var ids []string
+	for _, a := range m["appointments"].([]any) {
+		a := a.(map[string]any)
+		if !listed[a["r"].(string)] {
+			t.Errorf("appointment %v names missing resource %v", a["id"], a["r"])
+		}
+		ids = append(ids, a["id"].(string))
+	}
+	if !reflect.DeepEqual(ids, []string{"on-listed"}) {
+		t.Errorf("appointments = %v", ids)
+	}
+	if m["truncated"] != true {
+		t.Error("rows dropped by the resource cap but truncated not set")
+	}
+	// only an inactive resource's rows dropped: not a truncation
+	in.Bookings = in.Bookings[:2]
+	raw, _ = snapshot.Build(in)
+	if decode(t, raw)["truncated"] != false {
+		t.Error("inactive resource rows flagged truncated")
+	}
+}

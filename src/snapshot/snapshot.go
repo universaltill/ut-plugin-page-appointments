@@ -116,22 +116,38 @@ func Build(in Input) ([]byte, error) {
 
 	recs := append([]store.ResourceRecord(nil), in.Resources...)
 	sort.Slice(recs, func(i, j int) bool { return recs[i].ID < recs[j].ID })
+	// listed: the resources the payload carries; overCap: active resources
+	// left out by MaxResources. An appointment is sent only on a listed
+	// resource, so the replica never draws a row on a missing `r`; rows on
+	// an over-cap resource are a truncation, rows on an inactive or unknown
+	// one are simply not shown.
+	listed, overCap := map[string]bool{}, map[string]bool{}
 	for _, r := range recs {
-		if !r.Active || len(p.Resources) == MaxResources {
+		if !r.Active {
 			continue
 		}
+		if len(p.Resources) == MaxResources {
+			overCap[r.ID] = true
+			continue
+		}
+		listed[r.ID] = true
 		p.Resources = append(p.Resources, resourceOut{
 			ID: r.ID, Kind: r.Kind, Name: cut(r.DisplayName, MaxResNameLen), Colour: cut(r.Colour, MaxColourLen),
 		})
 	}
 
 	rows := make([]apptOut, 0, len(in.Bookings))
+	droppedByCap := false
 	for _, b := range in.Bookings {
 		a := b.Appointment
 		if a.Source != "own" || a.State == engine.CancelledByClient || a.State == engine.CancelledByShop {
 			continue
 		}
 		if !a.Start.Before(to) || !a.End.After(from) {
+			continue
+		}
+		if !listed[a.ResourceID] {
+			droppedByCap = droppedByCap || overCap[a.ResourceID]
 			continue
 		}
 		svc := []string{}
@@ -156,7 +172,7 @@ func Build(in Input) ([]byte, error) {
 	// Keep the longest prefix (the earliest rows) that fits.
 	fit := func(n int) ([]byte, error) {
 		p.Appointments = rows[:n]
-		p.Truncated = n < len(rows)
+		p.Truncated = n < len(rows) || droppedByCap
 		return json.Marshal(p)
 	}
 	raw, err := fit(len(rows))
