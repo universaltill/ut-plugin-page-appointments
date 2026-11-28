@@ -39,10 +39,15 @@ type ReceiptDesk interface {
 const maxReceipts = 30
 
 func init() {
-	userErrors = append(userErrors, checkout.ErrReceiptNotPaid, checkout.ErrUnknownAppointment, errNoReceipt)
+	userErrors = append(userErrors, checkout.ErrReceiptNotPaid, checkout.ErrUnknownAppointment, errNoReceipt, ErrReceiptsDenied)
 }
 
 var errNoReceipt = errors.New("no_receipt")
+
+// ErrReceiptsDenied is the receipt lookup refused for this role (no view:sales,
+// for example a cashier). The picker says so instead of showing a host error
+// page (#7267).
+var ErrReceiptsDenied = errors.New("receipts_denied")
 
 func (e *env) canErase(b Booking) bool {
 	_, ok := e.deps.Store.(Eraser)
@@ -110,6 +115,9 @@ func (e *env) receiptPicker(b Booking) (*Document, error) {
 		return e.detail(b, e.errNotice(engine.ErrTransitionNotAllowed)), nil
 	}
 	rs, err := rd.Receipts()
+	if errors.Is(err, ErrReceiptsDenied) {
+		return e.detail(b, e.errNotice(err)), nil
+	}
 	if err != nil {
 		return nil, err
 	}

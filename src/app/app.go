@@ -56,6 +56,9 @@ type Deps struct {
 	// ShopCurrency reads the till's currency (shop.context.v2); nil skips the
 	// first-run seeding of the plugin's currency setting.
 	ShopCurrency func() (string, error)
+	// Records is the plugin-records channel for the replica snapshot; nil
+	// disables it.
+	Records Records
 	// IDs returns unique ids; nil uses random UUIDv4 text.
 	IDs engine.IDGen
 	// Now overrides the event time (tests); zero uses the event's timestamp.
@@ -117,7 +120,7 @@ func handle(d Deps, ev plugin.Event) (any, error) {
 
 	switch ev.Type {
 	case TickEvent:
-		return nil, tick(ctx, repo, proc)
+		return nil, tick(ctx, repo, proc, d, now)
 	case evViewAsk, evActionAsk:
 	default:
 		return nil, nil
@@ -126,12 +129,19 @@ func handle(d Deps, ev plugin.Event) (any, error) {
 	if err := ev.Decode(&p); err != nil {
 		return nil, fmt.Errorf("appointments: bad ask: %w", err)
 	}
+	if d.isReplica() {
+		// A replica writes no appointment data and offers no action: every
+		// page is the main till's read-only snapshot (design 7207 section 5).
+		return replicaAnswer(d, p, now)
+	}
 	seedCurrency(ctx, repo, d)
 	if isCalendar(p.View) {
 		if ev.Type == evViewAsk {
-			// Opening the calendar also runs the retention purge, so the
-			// settings page's "blanked automatically" holds without a tick.
-			_ = purge(ctx, repo)
+			// Only the cheap, day-bounded part of the retention purge runs on
+			// the interactive path (yesterday's walk-in queue, first names).
+			// The scan of the appointment table belongs to the schedule tick
+			// (hourly), so an open never pays for a large database (#7268).
+			_ = purgeQueue(ctx, repo)
 			_ = proc.Flush()
 		}
 		st := &adapter.Desk{Store: &adapter.Store{Ctx: ctx, Repo: repo, Catalogue: d.Catalogue, OriginTill: OriginTill},
@@ -145,6 +155,9 @@ func handle(d Deps, ev plugin.Event) (any, error) {
 		if err != nil {
 			return nil, err // never encode the empty answer of a failed ask
 		}
+		if ev.Type == evActionAsk {
+			_ = publishSnapshot(ctx, repo, d, now) // never blocks the operator
+		}
 		return ans, nil
 	}
 	h := &admin.Handler{Repo: repo, NewID: ids, Prices: prices(d)}
@@ -153,6 +166,11 @@ func handle(d Deps, ev plugin.Event) (any, error) {
 		resp admin.Response
 		err  error
 	)
+	defer func() { // a changed resource or service reaches replicas too
+		if ev.Type == evActionAsk && err == nil {
+			_ = publishSnapshot(ctx, repo, d, now)
+		}
+	}()
 	if ev.Type == evViewAsk {
 		resp, err = h.HandleView(ctx, admin.ViewRequest{View: p.View, Params: p.Params, Locale: p.Locale, Operator: op})
 	} else {
@@ -178,7 +196,7 @@ func toAdminOperator(o *calendar.Operator) *admin.Operator {
 // tick is the schedule event: retention purge (names and the day's queue),
 // the reconcile of any state projection a crash left behind, and the
 // republish of unpublished completions.
-func tick(ctx context.Context, repo *store.Repository, proc *checkout.Processor) error {
+func tick(ctx context.Context, repo *store.Repository, proc *checkout.Processor, d Deps, now time.Time) error {
 	var errs []string
 	if err := purge(ctx, repo); err != nil {
 		errs = append(errs, "purge: "+err.Error())
@@ -189,6 +207,9 @@ func tick(ctx context.Context, repo *store.Repository, proc *checkout.Processor)
 	if err := proc.Flush(); err != nil {
 		errs = append(errs, "flush: "+err.Error())
 	}
+	if err := publishSnapshot(ctx, repo, d, now); err != nil {
+		errs = append(errs, "snapshot: "+err.Error())
+	}
 	if len(errs) > 0 {
 		return fmt.Errorf("appointments tick: %s", strings.Join(errs, "; "))
 	}
@@ -197,6 +218,15 @@ func tick(ctx context.Context, repo *store.Repository, proc *checkout.Processor)
 
 func purge(ctx context.Context, repo *store.Repository) error {
 	_, err := repo.Purge(ctx)
+	return err
+}
+
+func purgeQueue(ctx context.Context, repo *store.Repository) error {
+	day, err := repo.DayStart(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = repo.PurgeQueue(ctx, day)
 	return err
 }
 

@@ -114,8 +114,8 @@ type PurgeResult struct {
 // pages by keyset over the rows that still carry a name, so it works at any
 // table size under the host's result cap. It also clears the walk-in queue of
 // entries from before today (their first names have no retention beyond the
-// business day). main.go runs it on the plugin's own schedule tick and before
-// every calendar view.
+// business day). main.go runs it on the plugin's own schedule tick; the calendar open runs
+// only the queue part.
 func (r *Repository) Purge(ctx context.Context) (PurgeResult, error) {
 	res, err := r.purgeAppointments(ctx)
 	if err != nil {

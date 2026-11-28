@@ -4,11 +4,13 @@ package hostview_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 
 	"github.com/universaltill/universal-till/sdk/plugin"
 
+	"github.com/universaltill/ut-plugin-page-appointments/src/calendar"
 	"github.com/universaltill/ut-plugin-page-appointments/src/hostview"
 )
 
@@ -130,5 +132,17 @@ func TestReceiptsBusyDayListsTheNewest(t *testing.T) {
 		if ok, err := (hostview.Receipts{}).Paid(fmt.Sprintf("r%d", n-1)); !ok || err != nil || calls > hostview.MaxReceiptCalls {
 			t.Fatalf("n=%d: newest not paid: %v %v calls %d", n, ok, err, calls)
 		}
+	}
+}
+
+// #7267: a role without view:sales (a cashier) gets the typed refusal, not a
+// host error page.
+func TestReceiptsDeniedIsTyped(t *testing.T) {
+	fake(t, func(string, json.RawMessage) (json.RawMessage, error) { return nil, plugin.ErrDenied })
+	if _, err := (hostview.Receipts{}).Recent(); !errors.Is(err, calendar.ErrReceiptsDenied) {
+		t.Fatalf("Recent: %v", err)
+	}
+	if _, err := (hostview.Receipts{}).Paid("s1"); !errors.Is(err, calendar.ErrReceiptsDenied) {
+		t.Fatalf("Paid: %v", err)
 	}
 }

@@ -1,7 +1,7 @@
 {
   "id": "com.universaltill.page-appointments",
   "name": "Appointments",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Own appointment calendar for service shops: day calendar, walk-in queue, check-in, completion with a paid receipt, and staff, services and hours setup. Bookings are kept in the plugin's own database on this till.",
   "author": "Universal Till",
   "website": "https://universaltill.com",
@@ -19,7 +19,8 @@
     "schedule",
     "view:sales",
     "view:inventory",
-    "view:shop"
+    "view:shop",
+    "records:sync"
   ],
   "views_used": [
     "catalog.items.v1",
@@ -29,6 +30,11 @@
   "db": {
     "migrations": "db/migrations"
   },
+  "records_forward": {
+    "snapshots": [
+      "calendar"
+    ]
+  },
   "retention": {
     "keep_years": 1,
     "reason_key": "appointments.retention.reason"
@@ -36,8 +42,8 @@
   "schedules": [
     {
       "event": "com.universaltill.page-appointments.tick",
-      "every_s": 3600,
-      "jitter_s": 300
+      "every_s": 900,
+      "jitter_s": 60
     }
   ],
   "hooks": [

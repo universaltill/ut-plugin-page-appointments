@@ -115,6 +115,9 @@ func (p *receiptPager) page(off int) ([]receiptRow, error) {
 	}
 	p.calls++
 	raw, err := Query("sales.receipts.v1", map[string]int{"days_ago": 0, "offset": off, "limit": receiptPage})
+	if errors.Is(err, plugin.ErrDenied) {
+		return nil, calendar.ErrReceiptsDenied
+	}
 	if err != nil {
 		return nil, fmt.Errorf("hostview: sales.receipts.v1: %w", err)
 	}
