@@ -5,4 +5,7 @@
 // goroutine use, and every amount is money.Money. Output slices are sorted by
 // a stated key, never by map iteration order. The engine returns events as
 // values; it never persists or publishes them.
+//
+// Existing-appointment inputs may contain superseded rows: every reader
+// applies Current first, so a row replaced by a reschedule never holds time.
 package engine

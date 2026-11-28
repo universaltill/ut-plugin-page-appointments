@@ -74,7 +74,7 @@ func EstimateNearestFree(loc *time.Location, resources []Resource, existing []Ap
 	queueAhead []Walkin, next Walkin, p Policy, now time.Time) Estimate {
 	now = ceilMinute(now.UTC())
 	var holds []resHold
-	for _, a := range existing {
+	for _, a := range Current(existing) {
 		if !a.State.Holds() {
 			continue
 		}
