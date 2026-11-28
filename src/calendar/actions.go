@@ -123,7 +123,8 @@ func (e *env) detail(b Booking, lead ...Component) *Document {
 	if b.State == engine.NoShow && !e.op.IsManager() {
 		doc.Components = append(doc.Components, para(Key("appt.cal.ask_manager")))
 	}
-	if b.State == engine.InService {
+	doc.Components = append(doc.Components, e.deskButtons(b)...)
+	if b.State == engine.InService && !e.canReceipt(b) {
 		doc.Components = append(doc.Components, para(Key("appt.cal.complete_at_till")))
 	}
 	if (b.State == engine.Booked || b.State == engine.Confirmed) && !e.hasVerb(vs, "noshow") {

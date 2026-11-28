@@ -103,11 +103,21 @@ func (e *env) dayDocument(d engine.Date, lead ...Component) (*Document, error) {
 	}
 	opened := 0
 	skipped := 0
+	hasBooking := map[string]bool{}
+	for _, b := range bs {
+		hasBooking[b.ResourceID] = true
+	}
 	for _, s := range staff {
-		if !s.Active {
+		// An inactive staff member is drawn only when bookings still sit on
+		// the day, so they stay openable, movable and cancellable (N4).
+		if !s.Active && !hasBooking[s.ID] {
 			continue
 		}
-		doc.Components = append(doc.Components, heading(Lit(s.Name)), para(Lit(e.hoursText(s, d))))
+		name := s.Name
+		if !s.Active {
+			name += " (" + e.t.s("appt.cal.tag.inactive") + ")"
+		}
+		doc.Components = append(doc.Components, heading(Lit(name)), para(Lit(e.hoursText(s, d))))
 		if off := e.timeOffText(s, from, to); off != "" {
 			doc.Components = append(doc.Components, notice("info", Lit(off)))
 		}

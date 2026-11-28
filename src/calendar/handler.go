@@ -99,6 +99,14 @@ func (e *env) act(a Ask) (*Document, string, error) {
 	case strings.HasPrefix(name, "domove_"):
 		doc, err := e.place(a, untoken(strings.TrimPrefix(name, "domove_")))
 		return doc, "", err
+	case strings.HasPrefix(name, "erasecheck_"):
+		return e.onBooking(strings.TrimPrefix(name, "erasecheck_"), back, func(b Booking) (*Document, error) { return e.eraseCheck(b), nil })
+	case strings.HasPrefix(name, "erase_"):
+		return e.onBooking(strings.TrimPrefix(name, "erase_"), back, e.erase)
+	case strings.HasPrefix(name, "receipt_"):
+		return e.onBooking(strings.TrimPrefix(name, "receipt_"), back, e.receiptPicker)
+	case strings.HasPrefix(name, "finish_"):
+		return e.onBooking(strings.TrimPrefix(name, "finish_"), back, func(b Booking) (*Document, error) { return e.finish(a, b) })
 	case strings.HasPrefix(name, "ask_"), strings.HasPrefix(name, "do_"):
 		ask := strings.HasPrefix(name, "ask_")
 		parts := strings.SplitN(name, "_", 3)

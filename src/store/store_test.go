@@ -18,7 +18,7 @@ var ctx = context.Background()
 
 func TestMigrations_LoadAndShape(t *testing.T) {
 	ms, err := store.Migrations()
-	if err != nil || len(ms) != 2 || ms[0].Name != "schema" || ms[1].Name != "appointments" {
+	if err != nil || len(ms) != 3 || ms[0].Name != "schema" || ms[1].Name != "appointments" || ms[2].Name != "queue_chain" {
 		t.Fatalf("%v %+v", err, ms)
 	}
 	if len(ms[0].Checksum()) != 64 || ms[0].Checksum() == ms[1].Checksum() {

@@ -104,6 +104,7 @@ func namedIDs(all []*chainRow) []string {
 type PurgeResult struct {
 	Chains int // chains whose names were blanked
 	Rows   int // rows blanked
+	Queue  int // queue entries deleted (older than the business day, or seated)
 }
 
 // Purge blanks client_first_name, in place, on every row of each appointment
@@ -111,9 +112,24 @@ type PurgeResult struct {
 // retention period ago (default 90 days, at most 730). It writes one purge
 // event per chain, without the name, before it blanks. It is idempotent. It
 // pages by keyset over the rows that still carry a name, so it works at any
-// table size under the host's result cap. Nothing calls it yet: a trigger (for
-// example on every event) is part of wiring the slice to a till.
+// table size under the host's result cap. It also clears the walk-in queue of
+// entries from before today (their first names have no retention beyond the
+// business day). main.go runs it on the plugin's own schedule tick and before
+// every calendar view.
 func (r *Repository) Purge(ctx context.Context) (PurgeResult, error) {
+	res, err := r.purgeAppointments(ctx)
+	if err != nil {
+		return res, err
+	}
+	day, err := r.DayStart(ctx)
+	if err != nil {
+		return res, err
+	}
+	res.Queue, err = r.PurgeQueue(ctx, day)
+	return res, err
+}
+
+func (r *Repository) purgeAppointments(ctx context.Context) (PurgeResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	set, err := r.Settings(ctx)

@@ -107,6 +107,17 @@ type fakeStore struct {
 	outbox  map[string]Completion
 	order   []string
 	failCom bool
+	// currency by appointment id; "" means GBP.
+	currency map[string]string
+}
+
+func (s *fakeStore) Currency(id string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c := s.currency[id]; c != "" {
+		return c, nil
+	}
+	return "GBP", nil
 }
 
 func newStore(as ...engine.Appointment) *fakeStore {
@@ -188,8 +199,7 @@ func newProc(st *fakeStore, pub *fakePub) *Processor {
 	n := 0
 	return &Processor{
 		Store: st, Pub: pub, Clock: fixedClock{}, Policy: engine.DefaultPolicy(),
-		IDs:      func() string { n++; return fmt.Sprintf("ev%d", n) },
-		Currency: "GBP",
+		IDs: func() string { n++; return fmt.Sprintf("ev%d", n) },
 		StaffRef: func(r string) string {
 			if r == "r1" {
 				return "staff-9"
@@ -458,5 +468,19 @@ func TestConcurrentRedelivery_RaceFree(t *testing.T) {
 	wg.Wait()
 	if len(st.events) != 1 || len(pub.got) != 1 {
 		t.Fatalf("events %d published %d", len(st.events), len(pub.got))
+	}
+}
+
+// N5: the completed event carries the appointment record's own currency.
+func TestCompleted_UsesTheRecordCurrency_N5(t *testing.T) {
+	st := newStore(appt(engine.InService))
+	st.currency = map[string]string{"a1": "EUR"}
+	pub := &fakePub{}
+	p := newProc(st, pub)
+	if _, err := p.CompleteByReceipt("a1", "sale-1", "u1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(pub.got) != 1 || !strings.Contains(pub.got[0], `"currency":"EUR"`) {
+		t.Fatalf("published %+v", pub.got)
 	}
 }

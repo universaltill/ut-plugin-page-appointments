@@ -1,7 +1,10 @@
 # src/checkout and src/logbook: what is built, what each function awaits
 
-Pure logic only (slices #7115, #7116). Nothing here is wired to the till or
-runs in `main.go`. Binding rules of appointment-v1.md section 6: no deposit
+Pure logic (slices #7115, #7116). `src/adapter` (`Checkout`, `Desk`) wires the
+store, the outbox and the manual completion by receipt (the calendar's
+"Complete with a receipt" screen, over `sales.receipts.v1`) on the plugin's own
+database (ut-docs#7208). The `sale.completed` path is still unwired: it waits
+for the core basket seam below, so no hook for it is declared. Binding rules of appointment-v1.md section 6: no deposit
 logic, no client name on the basket line or the receipt. Locale keys are in
 `locales/en.json` of each package (English only; Weblate translates).
 
@@ -9,7 +12,7 @@ logic, no client name on the basket line or the receipt. Locale keys are in
 |---|---|
 | `BuildLines` (basket line spec, ref `appt:<id>:<i>`, no price, quote is display only) | Neutral basket seam: `add_to_basket` from a plugin overlay view with an opaque per-line `ref` (today refused outside `sell.identify`, suggestions.go:163-166; `AddToBasket` has only sku and qty). No card yet: ADR-0221 section 8 item 2. |
 | `ParseRef`, `HandleSaleCompleted` (match by ref, complete once, two-step checked_in -> in_service -> completed) | The same seam: core must persist `ref` on the sale line and echo it in `sale.completed` `line_items[]` (`SaleLine` in core ipc.go has no ref). Also `view:sales` consent for the plugin to receive `sale.completed`. |
-| `Processor.Store` (`Commit` atomic: appointment, events, outbox) | Guest database host functions, #3157, and the #7113 repository. |
+| `Processor.Store` (`Commit`: appointment, events, outbox) | Done: `adapter.Checkout`. The host has no transaction, so the three writes are ordered (state, events, outbox) and `Pending` rebuilds the outbox row of a completed appointment a crash left out. |
 | `Processor.Flush`, `Publisher` (publish, mark only on code 0, republish on next event) | Nothing missing: `event_publish` exists. Needs the plugin to be subscribed to some event to get a "next event". |
 | `BuildPayload`, `EventName` | Nothing missing (name pinned to manifest.json by a test). |
 | `CompleteByReceipt`, `ReceiptChecker` (manual path, B2) | Core view `sales.receipts.v1` (ADR-0149 section 6) and its consent; the UI to pick a receipt is #7114 territory. Works without the basket seam. |

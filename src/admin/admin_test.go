@@ -333,6 +333,9 @@ func TestLocale_EveryKeyDefinedAndUsed(t *testing.T) {
 	}
 	used[admin.KeyOverrideReasonHint] = true
 	used["appointments.admin.saved"] = true
+	// keys the manifest names (entry label, retention reason); scripts/validate.sh checks they exist
+	used["appointments.nav.today"] = true
+	used["appointments.retention.reason"] = true
 	var missing, unused []string
 	for k := range used {
 		if _, ok := en[k]; !ok {
@@ -367,7 +370,7 @@ func TestLocale_EnglishOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, e := range es {
-		if n := e.Name(); n != "en.json" && n != "locales.go" {
+		if n := e.Name(); n != "en.json" && n != "locales.go" && n != "locales_test.go" {
 			t.Fatalf("unexpected locale file %q: only en.json is allowed", n)
 		}
 	}
@@ -402,7 +405,7 @@ func TestResources_SaveAndList(t *testing.T) {
 		t.Fatalf("%+v", rs)
 	}
 	b, _ := json.Marshal(view(t, h, admin.ViewResources, ""))
-	if !strings.Contains(string(b), `"Samira"`) || !strings.Contains(string(b), `"inactive"`) {
+	if !strings.Contains(string(b), `"Samira"`) || !strings.Contains(string(b), `"Inactive"`) {
 		t.Fatalf("%s", b)
 	}
 	// errors become notices, nothing is half written
@@ -444,7 +447,7 @@ func TestServices_SaveListPriceFromCatalogue(t *testing.T) {
 	// a service with no catalogue price shows an empty cell, not a made-up one
 	act(t, h, admin.ViewServices, admin.ActSaveService, map[string]any{"sku": "dye", "duration_min": "90", "buffer_min": "0", "all_resources": true})
 	b, _ = json.Marshal(view(t, h, admin.ViewServices, ""))
-	if !strings.Contains(string(b), `"dye",90,0,"*","inactive",null`) {
+	if !strings.Contains(string(b), `"dye",90,0,"*","Inactive",null`) {
 		t.Fatalf("%s", b)
 	}
 	for name, form := range map[string]map[string]any{
@@ -678,5 +681,91 @@ func TestLocale_NoClaimsWithoutAPath(t *testing.T) {
 	}
 	if v := en["appt.cal.complete_at_till"]; strings.Contains(v, "at the till") {
 		t.Fatalf("completion text promises a path that does not exist: %q", v)
+	}
+}
+
+// ---- review N3 / N14 --------------------------------------------------------------
+
+func fieldValue(t *testing.T, d admin.Document, formAction, field string) any {
+	t.Helper()
+	b, _ := json.Marshal(d)
+	var g struct {
+		Components []struct {
+			Type   string `json:"type"`
+			Action string `json:"action"`
+			Fields []struct {
+				Name  string `json:"name"`
+				Value any    `json:"value"`
+			} `json:"fields"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(b, &g); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range g.Components {
+		if c.Type == "form" && c.Action == formAction {
+			for _, f := range c.Fields {
+				if f.Name == field {
+					return f.Value
+				}
+			}
+		}
+	}
+	t.Fatalf("no field %s in form %s", field, formAction)
+	return nil
+}
+
+func TestResources_EditFormIsPrefilledAndKeepsLogbookLink_N3(t *testing.T) {
+	h, repo := newHandler(t)
+	_ = repo.SaveResource(ctx, store.ResourceRecord{Resource: engine.Resource{ID: "r1", Kind: "chair", Active: false},
+		DisplayName: "Sam", Colour: "#abc", LogbookStaffRef: "lb-7"})
+	d := view(t, h, admin.ViewResources, "r1")
+	for f, want := range map[string]any{"resource": "r1", "name": "Sam", "kind": "chair", "colour": "#abc", "status": "inactive", "logbook_staff_ref": "lb-7"} {
+		if got := fieldValue(t, d, admin.ActSaveResource, f); got != want {
+			t.Errorf("field %s = %v, want %v", f, got, want)
+		}
+	}
+	// the "show" action reloads the form for the chosen resource
+	d = act(t, h, admin.ViewResources, admin.ActShowResource, map[string]any{"resource": "r1"})
+	if fieldValue(t, d, admin.ActSaveResource, "logbook_staff_ref") != "lb-7" {
+		t.Error("show_resource did not pre-fill")
+	}
+	// a save that leaves the optional fields out keeps the stored values
+	act(t, h, admin.ViewResources, admin.ActSaveResource, map[string]any{"resource": "r1", "name": "Samira"})
+	rs, _ := repo.Resources(ctx)
+	if rs[0].DisplayName != "Samira" || rs[0].LogbookStaffRef != "lb-7" || rs[0].Colour != "#abc" || rs[0].Kind != "chair" || rs[0].Active {
+		t.Errorf("a save wiped stored fields: %+v", rs[0])
+	}
+}
+
+func TestTableCellsComeFromTheBundle_N14(t *testing.T) {
+	h, repo := newHandler(t)
+	_ = repo.SaveResource(ctx, store.ResourceRecord{Resource: engine.Resource{ID: "r1", Kind: "staff", Active: true}, DisplayName: "Sam"})
+	_, _ = repo.AddTimeOff(ctx, "r1", time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 2, 2, 0, 0, 0, 0, time.UTC), "holiday")
+	_ = repo.SaveService(ctx, engine.Service{SKU: "cut", DurationMin: 30, All: true, Active: false})
+	for _, v := range []string{admin.ViewResources, admin.ViewServices, admin.ViewTimeOff} {
+		b, _ := json.Marshal(view(t, h, v, ""))
+		var g struct {
+			Components []struct {
+				Type string  `json:"type"`
+				Rows [][]any `json:"rows"`
+			} `json:"components"`
+		}
+		_ = json.Unmarshal(b, &g)
+		rows := 0
+		for _, c := range g.Components {
+			for _, r := range c.Rows {
+				rows++
+				for _, cell := range r {
+					switch cell {
+					case "active", "inactive", "staff", "chair", "holiday", "away", "other":
+						t.Errorf("%s: raw English literal %q in a table cell", v, cell)
+					}
+				}
+			}
+		}
+		if rows == 0 {
+			t.Errorf("%s: no table rows drawn", v)
+		}
 	}
 }

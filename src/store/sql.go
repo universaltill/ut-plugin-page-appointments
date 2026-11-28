@@ -52,4 +52,24 @@ const (
 	// differs from the to_state of their last event (or that have no event).
 	// "Last" is insert order (rowid), never the wall clock, which can step back.
 	SQLStaleProjection = `SELECT a.id AS id, a.state AS state, COALESCE((SELECT e.to_state FROM appointment_events e WHERE e.appointment_id = a.id ORDER BY e.rowid DESC LIMIT 1), '') AS last_state FROM appointments a WHERE a.id > ?1 AND a.state <> COALESCE((SELECT e.to_state FROM appointment_events e WHERE e.appointment_id = a.id ORDER BY e.rowid DESC LIMIT 1), '') ORDER BY a.id LIMIT ?2`
+
+	// The walk-in queue. A queue entry that has become an appointment (same
+	// id, see calendar queueSeat) is never listed, so a crash between the
+	// insert and the dequeue cannot leave a walk-in both seated and queued.
+	SQLInsertQueue = `INSERT INTO walkin_queue (id, seq, arrived_utc, first_name, service_sku, duration_min, buffer_min, resource_ids) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+	SQLListQueue   = `SELECT id, seq, arrived_utc, first_name, service_sku, duration_min, buffer_min, resource_ids FROM walkin_queue q WHERE q.arrived_utc >= ?1 AND NOT EXISTS (SELECT 1 FROM appointments a WHERE a.id = q.id) ORDER BY q.seq, q.id LIMIT 500`
+	SQLDeleteQueue = `DELETE FROM walkin_queue WHERE id = ?1`
+	// SQLPurgeQueue removes every entry that arrived before ?1 (the start of
+	// the shop's business day) and every entry already seated: a queue name has
+	// no retention beyond the day (N9).
+	SQLPurgeQueue = `DELETE FROM walkin_queue WHERE arrived_utc < ?1 OR id IN (SELECT id FROM appointments)`
+
+	// The completion outbox: the frozen appointment.completed payload, written
+	// after the state moved to completed (the host has no transaction), and
+	// marked once event_publish accepted it. A completed row without an outbox
+	// row (a crash in between) is found by SQLUnoutboxed and rebuilt.
+	SQLInsertOutbox  = `INSERT OR IGNORE INTO completion_outbox (appointment_id, sale_ref, payload, published) VALUES (?1, ?2, ?3, 0)`
+	SQLPendingOutbox = `SELECT appointment_id, sale_ref, payload FROM completion_outbox WHERE published = 0 ORDER BY appointment_id LIMIT 20`
+	SQLMarkPublished = `UPDATE completion_outbox SET published = 1 WHERE appointment_id = ?1`
+	SQLUnoutboxed    = `SELECT a.id AS id FROM appointments a WHERE a.state = 'completed' AND a.sale_ref <> '' AND NOT EXISTS (SELECT 1 FROM completion_outbox o WHERE o.appointment_id = a.id) AND NOT EXISTS (SELECT 1 FROM appointments s WHERE s.supersedes_id = a.id) ORDER BY a.id LIMIT 20`
 )

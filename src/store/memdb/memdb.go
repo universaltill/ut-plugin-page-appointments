@@ -150,6 +150,9 @@ func (d *DB) Exec(_ context.Context, q string, a ...any) (int64, error) {
 		d.tables["appointment_lines"] = append(d.tables["appointment_lines"], r)
 		return 1, nil
 	case store.SQLInsertAppointment:
+		if a[13] != "" && d.find("appointments", func(o rec) bool { return o["supersedes_id"] == a[13] }) >= 0 {
+			return 0, fmt.Errorf("memdb: UNIQUE constraint failed: appointments.supersedes_id")
+		}
 		return 1, d.insert("appointments", rec{"id": a[0], "origin_till_id": a[1], "source": a[2], "resource_id": a[3],
 			"start_utc": asInt(a[4]), "end_utc": asInt(a[5]), "buffer_min": asInt(a[6]), "walk_in": asInt(a[7]), "state": a[8],
 			"client_first_name": a[9], "currency": a[10], "sale_ref": a[11], "late_cancel": asInt(a[12]),
@@ -166,6 +169,29 @@ func (d *DB) Exec(_ context.Context, q string, a ...any) (int64, error) {
 	case store.SQLInsertEvent:
 		return 1, d.insert("appointment_events", rec{"id": a[0], "appointment_id": a[1], "at": asInt(a[2]), "actor_user_id": a[3],
 			"kind": a[4], "from_state": a[5], "to_state": a[6], "reason": a[7], "conflicting_ids": a[8]}, "id")
+	case store.SQLInsertQueue:
+		return 1, d.insert("walkin_queue", rec{"id": a[0], "seq": asInt(a[1]), "arrived_utc": asInt(a[2]), "first_name": a[3],
+			"service_sku": a[4], "duration_min": asInt(a[5]), "buffer_min": asInt(a[6]), "resource_ids": a[7]}, "id")
+	case store.SQLDeleteQueue:
+		return d.del("walkin_queue", func(o rec) bool { return o["id"] == a[0] }), nil
+	case store.SQLPurgeQueue:
+		return d.del("walkin_queue", func(o rec) bool {
+			return o["arrived_utc"].(int64) < asInt(a[0]) || d.find("appointments", func(x rec) bool { return x["id"] == o["id"] }) >= 0
+		}), nil
+	case store.SQLInsertOutbox:
+		if d.find("completion_outbox", func(o rec) bool { return o["appointment_id"] == a[0] }) >= 0 {
+			return 0, nil
+		}
+		return 1, d.insert("completion_outbox", rec{"appointment_id": a[0], "sale_ref": a[1], "payload": a[2], "published": int64(0)})
+	case store.SQLMarkPublished:
+		var n int64
+		for _, o := range d.tables["completion_outbox"] {
+			if o["appointment_id"] == a[0] && o["published"] != int64(1) {
+				o["published"] = int64(1)
+				n++
+			}
+		}
+		return n, nil
 	case store.SQLBlankName:
 		i := d.find("appointments", func(o rec) bool { return o["id"] == a[0] && o["client_first_name"] != "" })
 		if i < 0 {
@@ -269,6 +295,32 @@ func (d *DB) Query(_ context.Context, q string, a ...any) ([]byte, error) {
 			}
 		}
 		rows = project(sorted(m, sortKeys("line_no")), "appointment_id", "line_no", "sku", "name_snapshot", "qty", "amount_minor", "duration_min", "buffer_min")
+	case store.SQLPendingOutbox:
+		var m []rec
+		for _, o := range d.tables["completion_outbox"] {
+			if o["published"] == int64(0) {
+				m = append(m, o)
+			}
+		}
+		rows = project(sorted(m, sortKeys("appointment_id")), "appointment_id", "sale_ref", "payload")
+	case store.SQLUnoutboxed:
+		var m []rec
+		for _, r := range d.tables["appointments"] {
+			if r["state"] == "completed" && r["sale_ref"] != "" && !d.superseded(r["id"].(string)) &&
+				d.find("completion_outbox", func(o rec) bool { return o["appointment_id"] == r["id"] }) < 0 {
+				m = append(m, r)
+			}
+		}
+		rows = project(sorted(m, sortKeys("id")), "id")
+	case store.SQLListQueue:
+		since := asInt(a[0])
+		var m []rec
+		for _, r := range d.tables["walkin_queue"] {
+			if r["arrived_utc"].(int64) >= since && d.find("appointments", func(x rec) bool { return x["id"] == r["id"] }) < 0 {
+				m = append(m, r)
+			}
+		}
+		rows = project(sorted(m, sortKeys("seq", "id")), "id", "seq", "arrived_utc", "first_name", "service_sku", "duration_min", "buffer_min", "resource_ids")
 	case store.SQLListEvents:
 		var m []rec
 		for _, r := range d.tables["appointment_events"] {

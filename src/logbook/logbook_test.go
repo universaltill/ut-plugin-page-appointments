@@ -3,7 +3,9 @@ package logbook
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -15,7 +17,7 @@ func TestParse_Good(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.AppointmentID != "a1" || e.StaffRef != "staff-9" || e.SaleRef != "sale-1" || e.Currency != "GBP" || len(e.Lines) != 2 || e.Lines[1].Qty != 2 || e.Lines[1].AmountMinor != 9000 {
+	if e.AppointmentID != "a1" || e.StaffRef != "staff-9" || e.SaleRef != "sale-1" || e.Currency != "GBP" || len(e.Lines) != 2 || e.Lines[1].Qty != 2 || e.Lines[1].Amount.Minor() != 9000 {
 		t.Fatalf("%+v", e)
 	}
 }
@@ -31,7 +33,6 @@ func TestParse_Refusals(t *testing.T) {
 		"no lines":     `{"appointment_id":"a1","resource_id":"r1","currency":"GBP","lines":[],"sale_ref":"s"}`,
 		"qty zero":     `{"appointment_id":"a1","resource_id":"r1","currency":"GBP","lines":[{"sku":"a","name_snapshot":"A","qty":0,"amount_minor":1}],"sale_ref":"s"}`,
 		"neg amount":   `{"appointment_id":"a1","resource_id":"r1","currency":"GBP","lines":[{"sku":"a","name_snapshot":"A","qty":1,"amount_minor":-1}],"sale_ref":"s"}`,
-		"unknown key":  `{"appointment_id":"a1","resource_id":"r1","currency":"GBP","client_first_name":"Zed","lines":[{"sku":"a","name_snapshot":"A","qty":1,"amount_minor":1}],"sale_ref":"s"}`,
 		"overflow sum": `{"appointment_id":"a1","resource_id":"r1","currency":"GBP","lines":[{"sku":"a","name_snapshot":"A","qty":1,"amount_minor":9000000000000000000},{"sku":"b","name_snapshot":"B","qty":1,"amount_minor":9000000000000000000}],"sale_ref":"s"}`,
 	}
 	for n, c := range cases {
@@ -71,7 +72,7 @@ func TestHandle_WritesOneEntryAndIsIdempotent(t *testing.T) {
 	st := &memStore{}
 	c := &Consumer{Store: st, Staff: staffSet{"staff-9": true}}
 	r, err := c.Handle([]byte(good))
-	if err != nil || r.Outcome != Written || r.Entry.TotalMinor != 11500 || r.Entry.StaffRef != "staff-9" {
+	if err != nil || r.Outcome != Written || r.Entry.Total.Minor() != 11500 || r.Entry.StaffRef != "staff-9" {
 		t.Fatalf("%+v %v", r, err)
 	}
 	if r.Entry.SaleRef != "sale-1" || r.Entry.Currency != "GBP" || len(r.Entry.Lines) != 2 {
@@ -162,5 +163,18 @@ func TestLocaleKeyExists(t *testing.T) {
 	}
 	if m[KeyUnmapped] == "" {
 		t.Fatal("missing " + KeyUnmapped)
+	}
+}
+
+// ADR-0039 allows additive payload fields: an unknown key is ignored and is
+// never copied into the entry (review N15).
+func TestParse_IgnoresUnknownFields(t *testing.T) {
+	p := `{"appointment_id":"a1","resource_id":"r1","logbook_staff_ref":"s","currency":"GBP","client_first_name":"Zed","future":{"x":1},"lines":[{"sku":"a","name_snapshot":"A","qty":1,"amount_minor":5,"extra":true}],"sale_ref":"s"}`
+	e, err := Parse([]byte(p))
+	if err != nil || e.AppointmentID != "a1" || len(e.Lines) != 1 || e.Lines[0].Amount.Minor() != 5 {
+		t.Fatalf("%+v %v", e, err)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", e), "Zed") {
+		t.Fatal("an unknown field reached the event")
 	}
 }

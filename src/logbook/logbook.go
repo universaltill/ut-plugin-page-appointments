@@ -1,6 +1,10 @@
 // Package logbook is the subscriber-side logic of slice #7116: it parses the
-// appointment.completed event into a logbook entry (ADR-0149 linked mode:
-// total and lines come from the paid sale) and applies it idempotently.
+// appointment.completed event into a logbook entry and applies it
+// idempotently. The total and the lines are the booking QUOTE carried in the
+// event (appointment-v1 section 5), NOT the amounts of the paid sale: a price
+// change or discount at the till makes them differ from the money taken. Whether
+// the logbook should read the paid amounts by sale_ref (ADR-0149 linked mode)
+// is an open contract question, see docs/open-questions-7208.md.
 //
 // No logbook plugin repository exists yet (#3700, #3702), so this package
 // defines the entry shape it needs behind two small interfaces (EntryStore,
@@ -15,7 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
+
+	"github.com/universaltill/ut-plugin-page-appointments/src/money"
 )
 
 // KeyUnmapped is the en.json key of the notice shown when no entry is
@@ -27,10 +32,10 @@ var ErrBadEvent = errors.New("bad_event")
 
 // Line is one entry line (name and amount are snapshots).
 type Line struct {
-	SKU         string
-	Name        string
-	Qty         int
-	AmountMinor int64
+	SKU    string
+	Name   string
+	Qty    int
+	Amount money.Money
 }
 
 // Entry is the logbook entry derived from one completed appointment. The
@@ -40,7 +45,7 @@ type Entry struct {
 	AppointmentID string
 	StaffRef      string
 	Currency      string
-	TotalMinor    int64
+	Total         money.Money
 	SaleRef       string
 	Lines         []Line
 }
@@ -71,11 +76,12 @@ type wire struct {
 	SaleRef       string     `json:"sale_ref"`
 }
 
-// Parse validates and decodes a payload strictly: unknown keys (a leaked
-// client name, say) are refused, not ignored.
+// Parse validates and decodes a payload. Unknown keys are ignored, never
+// copied: ADR-0039 allows additive fields, and refusing them would stop every
+// logbook entry the day the publisher adds one. Only the fields above are read,
+// so an unexpected key cannot reach an entry.
 func Parse(b []byte) (Event, error) {
 	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
 	var w wire
 	if err := dec.Decode(&w); err != nil {
 		return Event{}, fmt.Errorf("%w: %v", ErrBadEvent, err)
@@ -87,13 +93,15 @@ func Parse(b []byte) (Event, error) {
 		return Event{}, fmt.Errorf("%w: missing field", ErrBadEvent)
 	}
 	e := Event{AppointmentID: w.AppointmentID, ResourceID: w.ResourceID, StaffRef: w.StaffRef, Currency: w.Currency, SaleRef: w.SaleRef}
-	var total int64
+	var total money.Money
 	for _, l := range w.Lines {
-		if l.SKU == "" || l.Qty <= 0 || l.AmountMinor < 0 || total > math.MaxInt64-l.AmountMinor {
+		amt := money.FromMinor(l.AmountMinor)
+		total = total.Add(amt)
+		// Amounts are non-negative, so a negative running total is an overflow.
+		if l.SKU == "" || l.Qty <= 0 || amt.IsNegative() || total.IsNegative() {
 			return Event{}, fmt.Errorf("%w: bad line", ErrBadEvent)
 		}
-		total += l.AmountMinor
-		e.Lines = append(e.Lines, Line{SKU: l.SKU, Name: l.Name, Qty: l.Qty, AmountMinor: l.AmountMinor})
+		e.Lines = append(e.Lines, Line{SKU: l.SKU, Name: l.Name, Qty: l.Qty, Amount: amt})
 	}
 	return e, nil
 }
@@ -155,7 +163,7 @@ func (c *Consumer) Handle(payload []byte) (Result, error) {
 	e := Entry{ID: EntryID(ev.AppointmentID), AppointmentID: ev.AppointmentID, StaffRef: ev.StaffRef,
 		Currency: ev.Currency, SaleRef: ev.SaleRef, Lines: ev.Lines}
 	for _, l := range ev.Lines {
-		e.TotalMinor += l.AmountMinor
+		e.Total = e.Total.Add(l.Amount)
 	}
 	ins, err := c.Store.InsertIfAbsent(e)
 	if err != nil {

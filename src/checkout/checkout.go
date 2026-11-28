@@ -121,6 +121,10 @@ type Completion struct {
 // appointment state, its events and the outbox record in one transaction.
 type Store interface {
 	Appointment(id string) (engine.Appointment, bool, error)
+	// Currency is the ISO code stored on the appointment record (appointment-v1:
+	// stored so that a later currency change never mixes amounts). The completed
+	// event is published under it, never under a processor-wide setting.
+	Currency(id string) (string, error)
 	Commit(a engine.Appointment, evs []engine.Event, c Completion) error
 	Pending() ([]Completion, error)
 	MarkPublished(appointmentID string) error
@@ -167,7 +171,6 @@ type Processor struct {
 	Clock    engine.Clock
 	IDs      engine.IDGen
 	Policy   engine.Policy
-	Currency string
 	// StaffRef maps a resource id to its logbook_staff_ref ("" = unmapped).
 	StaffRef func(resourceID string) string
 
@@ -328,7 +331,11 @@ func (p *Processor) finish(a engine.Appointment, saleID, actor string) (Result, 
 	if p.StaffRef != nil {
 		ref = p.StaffRef(n.ResourceID)
 	}
-	payload, err := BuildPayload(n, p.Currency, ref)
+	currency, err := p.Store.Currency(n.ID)
+	if err != nil {
+		return Result{}, err
+	}
+	payload, err := BuildPayload(n, currency, ref)
 	if err != nil {
 		return Result{}, err
 	}

@@ -83,7 +83,14 @@ func DefaultSettings() Settings {
 }
 
 // Location loads the shop zone.
-func (s Settings) Location() (*time.Location, error) { return time.LoadLocation(s.ShopZone) }
+// "Local" is refused: it names the guest's own zone (UTC in a wasm module),
+// never the shop's.
+func (s Settings) Location() (*time.Location, error) {
+	if s.ShopZone == "Local" || s.ShopZone == "" {
+		return nil, ErrInvalidInput
+	}
+	return time.LoadLocation(s.ShopZone)
+}
 
 // ---- resources -----------------------------------------------------------
 
@@ -159,7 +166,10 @@ func (r *Repository) AddTimeOff(ctx context.Context, resourceID string, from, to
 func (r *Repository) DeleteTimeOff(ctx context.Context, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, err := r.db.Exec(ctx, SQLDeleteTimeOff, id)
+	n, err := r.db.Exec(ctx, SQLDeleteTimeOff, id)
+	if err == nil && n == 0 {
+		return ErrNotFound // already removed: never "Saved"
+	}
 	return err
 }
 
@@ -322,6 +332,36 @@ func (r *Repository) Settings(ctx context.Context) (Settings, error) {
 	return s, nil
 }
 
+// SettingStored reports whether the key was ever saved (Settings alone cannot
+// tell a stored value from a default).
+func (r *Repository) SettingStored(ctx context.Context, key string) (bool, error) {
+	rows, err := query(ctx, r.db, SQLListSettings)
+	if err != nil {
+		return false, err
+	}
+	for _, w := range rows {
+		if w.str("key") == key {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// SeedCurrency stores the currency only when none was saved: the till's
+// currency is the default, the shop's own choice always wins.
+func (r *Repository) SeedCurrency(ctx context.Context, code string) error {
+	if len(code) != 3 {
+		return ErrInvalidInput
+	}
+	if stored, err := r.SettingStored(ctx, "currency"); err != nil || stored {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.db.Exec(ctx, SQLUpsertSetting, "currency", code)
+	return err
+}
+
 // SaveSettings validates and stores the settings.
 func (r *Repository) SaveSettings(ctx context.Context, s Settings) error {
 	if err := s.Policy.Validate(); err != nil {
@@ -481,25 +521,102 @@ func (r *Repository) insertChecked(ctx context.Context, b Booking, set Settings,
 	if err != nil {
 		return Booking{}, err
 	}
+	if err := r.writeBooking(ctx, b, append([]engine.Event{created}, res.Events...)); err != nil {
+		return Booking{}, err
+	}
+	return b, nil
+}
+
+// writeBooking is the crash-safe write order for a new row: lines first
+// (unreferenced until the row exists), then the appointment row (the commit
+// point; a row with SupersedesID also takes the old row out of the calendar,
+// the unique index admits one superseder per row), then the events. A crash
+// after the row leaves a booking with missing events, which Reconcile
+// repairs. The caller holds r.mu.
+func (r *Repository) writeBooking(ctx context.Context, b Booking, events []engine.Event) error {
 	for i, l := range b.Lines {
 		if _, err := r.db.Exec(ctx, SQLInsertLine, b.ID, i, l.SKU, l.Name, l.Qty, l.Amount.Minor(), l.DurationMin, l.BufferMin); err != nil {
-			return Booking{}, err
+			return err
 		}
 	}
 	if _, err := r.db.Exec(ctx, SQLInsertAppointment, b.ID, b.OriginTillID, b.Source, b.ResourceID,
 		b.Start.Unix(), b.End.Unix(), b.BufferMin, b2i(b.WalkIn), string(b.State), b.FirstName, b.Currency,
 		b.SaleRef, b2i(b.LateCancel), b.SupersedesID, b.CreatedAt.Unix()); err != nil {
-		return Booking{}, err
+		if b.SupersedesID != "" && isUnique(err) {
+			return ErrNotCurrent // a concurrent move already superseded the row
+		}
+		return err
 	}
-	if err := r.insertEvent(ctx, created); err != nil {
-		return Booking{}, err
-	}
-	for _, ev := range res.Events {
+	for _, ev := range events {
 		if err := r.insertEvent(ctx, ev); err != nil {
-			return Booking{}, err
+			return err
 		}
 	}
-	return b, nil
+	return nil
+}
+
+func isUnique(err error) bool {
+	return err != nil && strings.Contains(strings.ToUpper(err.Error()), "UNIQUE")
+}
+
+// Insert writes a booking the calendar already checked for conflicts (the
+// calendar holds the policy and the override decision), with its events. It is
+// the write half of calendar.Store.Commit. A superseding row is refused with
+// ErrNotCurrent when the row it replaces is not current.
+func (r *Repository) Insert(ctx context.Context, b Booking, events []engine.Event) error {
+	name, err := ValidateFirstName(b.FirstName)
+	if err != nil {
+		return err
+	}
+	b.FirstName = name
+	if err := r.validateLines(b.Appointment); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b.SupersedesID != "" {
+		if cur, err := r.isCurrent(ctx, b.SupersedesID); err != nil {
+			return err
+		} else if !cur {
+			return ErrNotCurrent
+		}
+	}
+	if b.Currency == "" {
+		set, err := r.Settings(ctx)
+		if err != nil {
+			return err
+		}
+		b.Currency = set.Currency
+	}
+	return r.writeBooking(ctx, b, events)
+}
+
+// SetState moves the state projection of a current row from from to to.Appointment's
+// state (with LateCancel and SaleRef), then appends the events. The projection
+// is moved first with an optimistic check (ErrStale when the row is no longer
+// in state from); a crash before the events leaves a projection Reconcile
+// repairs. It is the write half of calendar.Store.Commit for an update.
+func (r *Repository) SetState(ctx context.Context, id string, from engine.State, to engine.Appointment, events []engine.Event) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur, err := r.isCurrent(ctx, id); err != nil {
+		return err
+	} else if !cur {
+		return ErrNotCurrent
+	}
+	n, err := r.db.Exec(ctx, SQLSetProjection, id, string(to.State), b2i(to.LateCancel), to.SaleRef, string(from))
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrStale
+	}
+	for _, e := range events {
+		if err := r.insertEvent(ctx, e); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func appointments(bs []Booking) []engine.Appointment {
@@ -620,6 +737,11 @@ func (r *Repository) get(ctx context.Context, id string) (Booking, error) {
 		return Booking{}, err
 	}
 	return b, nil
+}
+
+// IsCurrent reports whether no row supersedes the appointment.
+func (r *Repository) IsCurrent(ctx context.Context, id string) (bool, error) {
+	return r.isCurrent(ctx, id)
 }
 
 func (r *Repository) isCurrent(ctx context.Context, id string) (bool, error) {

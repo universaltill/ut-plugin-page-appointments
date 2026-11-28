@@ -84,6 +84,11 @@ func (e *env) estimateText(est engine.Estimate) string {
 	return e.hm(est.Start) + " " + e.staffName(est.ResourceID)
 }
 
+// maxQueueButtons caps the seat and drop buttons (two per entry) so a long
+// queue on a busy day stays under the view format's component limit; the
+// rest of the queue is still listed in the table, in order (N15).
+const maxQueueButtons = 20
+
 // queuePanel is the walk-in queue: who waits, the estimated start of each,
 // the buttons to seat or remove one, and the form to add one.
 func (e *env) queuePanel() ([]Component, error) {
@@ -106,10 +111,14 @@ func (e *env) queuePanel() ([]Component, error) {
 		out = append(out, table(
 			[]Component{Key("appt.cal.q_pos"), Key("appt.cal.col_client"), Key("appt.cal.col_service"), Key("appt.cal.q_estimate")},
 			[]string{"number", "text", "text", "text"}, rows))
-		for _, w := range q {
+		for i, w := range q {
 			tk := token(w.ID)
 			if tk == "" {
 				continue
+			}
+			if i >= maxQueueButtons {
+				out = append(out, notice("warn", e.t.lit("appt.cal.q_too_many", maxQueueButtons)))
+				break
 			}
 			out = append(out,
 				button("seat_"+tk, e.t.lit("appt.cal.q_seat", e.queueName(w)), "primary"),
@@ -239,7 +248,9 @@ func (e *env) queueSeat(tk string) (*Document, error) {
 		}
 		svc, _ := e.serviceBySKU(w.ServiceSKU)
 		draft := engine.Appointment{
-			ID: e.deps.IDs(), OriginTillID: e.shop.OriginTill, ResourceID: est.ResourceID,
+			// The seated row reuses the queue id: the queue never lists an id that is
+			// an appointment, so a crash before Dequeue cannot seat a walk-in twice.
+			ID: w.ID, OriginTillID: e.shop.OriginTill, ResourceID: est.ResourceID,
 			Start: est.Start, End: est.Start.Add(time.Duration(w.DurationMin) * time.Minute),
 			BufferMin: w.BufferMin,
 			Lines: []engine.Line{{SKU: w.ServiceSKU, Name: svc.Name, Qty: 1, Amount: svc.Price,
@@ -271,6 +282,11 @@ type clockAt struct{ t time.Time }
 func (c clockAt) Now() time.Time { return c.t }
 
 var errGone = errors.New("gone")
+
+// ErrGone is what a Store returns when the row an action names is superseded,
+// missing or no longer in the state the operator saw (a stale or repeated
+// post): the operator sees "no longer available", never a host error.
+var ErrGone = errGone
 
 func formStr(f map[string]any, k string) string {
 	s, _ := f[k].(string)

@@ -13,6 +13,7 @@ const (
 const (
 	ActSaveResource  = "save_resource"
 	ActSaveService   = "save_service"
+	ActShowResource  = "show_resource"
 	ActShowHours     = "show_hours"
 	ActAddHours      = "add_hours"
 	ActClearHours    = "clear_hours"
