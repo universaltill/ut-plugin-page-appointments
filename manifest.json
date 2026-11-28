@@ -1,8 +1,8 @@
 {
   "id": "com.universaltill.page-appointments",
   "name": "Appointments",
-  "version": "0.1.0",
-  "description": "Own appointment calendar for service shops: scheduling engine (slice 1, no UI yet).",
+  "version": "0.2.0",
+  "description": "Own appointment calendar for service shops: day calendar, walk-in queue, check-in, completion with a paid receipt, and staff, services and hours setup. Bookings are kept in the plugin's own database on this till.",
   "author": "Universal Till",
   "website": "https://universaltill.com",
   "canonical_type": "page",
@@ -13,10 +13,109 @@
     "GB"
   ],
   "permissions": [
-    "events:receive"
+    "events:receive",
+    "ui:page",
+    "db:own",
+    "schedule",
+    "view:sales",
+    "view:inventory",
+    "view:shop"
+  ],
+  "views_used": [
+    "catalog.items.v1",
+    "sales.receipts.v1",
+    "shop.context.v2"
+  ],
+  "db": {
+    "migrations": "db/migrations"
+  },
+  "retention": {
+    "keep_years": 1,
+    "reason_key": "appointments.retention.reason"
+  },
+  "schedules": [
+    {
+      "event": "com.universaltill.page-appointments.tick",
+      "every_s": 3600,
+      "jitter_s": 300
+    }
+  ],
+  "hooks": [
+    {
+      "event": "ui.view.ask",
+      "action": "view"
+    },
+    {
+      "event": "ui.action.ask",
+      "action": "view"
+    }
   ],
   "locales": [
     "en-GB"
+  ],
+  "entries": [
+    {
+      "type": "page",
+      "key": "calendar",
+      "label": "appt.cal.title",
+      "route": "/plugin/appointments",
+      "view": "appointments.day",
+      "sort_order": 10
+    },
+    {
+      "type": "page",
+      "key": "today",
+      "label": "appointments.nav.today",
+      "route": "/plugin/appointments/today",
+      "view": "appointments.today",
+      "sort_order": 11
+    },
+    {
+      "type": "page",
+      "key": "resources",
+      "label": "appointments.admin.resources.title",
+      "route": "/plugin/appointments/resources",
+      "view": "appointments.resources",
+      "sort_order": 20
+    },
+    {
+      "type": "page",
+      "key": "services",
+      "label": "appointments.admin.services.title",
+      "route": "/plugin/appointments/services",
+      "view": "appointments.services",
+      "sort_order": 21
+    },
+    {
+      "type": "page",
+      "key": "hours",
+      "label": "appointments.admin.hours.title",
+      "route": "/plugin/appointments/hours",
+      "view": "appointments.hours",
+      "sort_order": 22
+    },
+    {
+      "type": "page",
+      "key": "timeoff",
+      "label": "appointments.admin.timeoff.title",
+      "route": "/plugin/appointments/timeoff",
+      "view": "appointments.timeoff",
+      "sort_order": 23
+    },
+    {
+      "type": "page",
+      "key": "settings",
+      "label": "appointments.admin.settings.title",
+      "route": "/plugin/appointments/settings",
+      "view": "appointments.settings",
+      "sort_order": 24
+    },
+    {
+      "type": "button",
+      "key": "open-today",
+      "label": "appointments.nav.today",
+      "opens_view": "appointments.today"
+    }
   ],
   "entrypoint": "./bin/plugin.wasm"
 }

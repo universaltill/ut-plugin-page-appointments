@@ -44,12 +44,13 @@ type Queued struct {
 	ServiceSKU string
 }
 
-// Change is one write the calendar needs to be atomic. Nothing implements it
-// yet. The host refuses BEGIN/COMMIT for a guest and runs one statement per
-// call, so a store adapter cannot use a transaction: it must order the writes
-// (as store.Repository does) so that a crash leaves either nothing visible or
-// a state a reconcile repairs, for example seating a walk-in (Insert +
-// Dequeue) or a move (Insert + Superseded). That adapter needs its own card.
+// Change is one write the calendar needs. The host refuses BEGIN/COMMIT for a
+// guest and runs one statement per call, so a Store cannot use a transaction:
+// adapter.Store applies a Change in a crash-safe order (insert row, then
+// events, then the queue entry goes; an update moves the state projection
+// first, then appends events) and store.Reconcile repairs a crash in between.
+// A seated walk-in reuses its queue id, so the queue never lists a walk-in
+// that is already an appointment.
 type Change struct {
 	// Insert is a new appointment row (booking, walk-in, replacement row).
 	Insert *Booking
@@ -58,6 +59,11 @@ type Change struct {
 	// Update replaces the projected state (and LateCancel/SaleRef) of an
 	// existing row. Booking data never changes in place.
 	Update *Booking
+	// From is the state the decision behind Update was made on. The write is
+	// guarded on it (UPDATE ... WHERE state = From): if another event moved
+	// the row meanwhile, Commit returns ErrGone and nothing changes. An
+	// Update without From is refused.
+	From engine.State
 	// Events are appended to the audit log, in order.
 	Events []engine.Event
 	// Dequeue removes a queued walk-in; Enqueue adds one.
@@ -65,11 +71,13 @@ type Change struct {
 	Enqueue *Queued
 }
 
-// Store is what the calendar needs from persistence. It has no implementation
-// yet: store.Repository has different methods and the schema has no walk-in
-// queue table, so an adapter (with the queue table and a crash-safe write
-// order) is a separate card. The guest database seam is ut-docs#3157. Bookings returns the current rows
-// (never superseded ones, any state) that overlap [from, to).
+// Store is what the calendar needs from persistence; adapter.Store implements
+// it on store.Repository (ut-docs#7208). Bookings returns the current rows
+// (never superseded ones, any state) that overlap [from, to). Booking returns
+// a current row only: a superseded or missing row is "not found", so a
+// repeated post of a move cannot act on the old row. A Store may also
+// implement Eraser and ReceiptDesk (desk.go) to offer the erase and
+// complete-with-receipt buttons.
 type Store interface {
 	Shop() (Shop, error)
 	Staff() ([]Staff, error)

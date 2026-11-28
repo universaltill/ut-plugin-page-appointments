@@ -1,0 +1,255 @@
+package plugins
+
+// COPIED into the till's internal/plugins by scripts/realhost.sh; never
+// committed there. It runs the packaged Appointments plugin (the artifact
+// scripts/package.sh builds) against the REAL host: the real manifest
+// validator, the real install-time migration path (migrateDataForInstall),
+// the real wazero runtime with the real db_exec / db_query / view_query /
+// event_publish host functions, the real backup + restore and the real
+// keep_years uninstall retention. Same approach as slice B's
+// TestDBRealWasmGuestRoundTripAndBackupRestore_3157 (ut-docs#3157), ut-docs#7208.
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/universaltill/universal-till/internal/data"
+	"github.com/universaltill/universal-till/internal/db"
+	"github.com/universaltill/universal-till/internal/db/plugindb"
+	"github.com/universaltill/universal-till/internal/paths"
+)
+
+func apptExtract(t *testing.T, artifact, dst string) {
+	t.Helper()
+	f, err := os.Open(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dst, filepath.Clean(h.Name))
+		if !strings.HasPrefix(p, dst+string(os.PathSeparator)) {
+			t.Fatalf("path escape %q", h.Name)
+		}
+		if h.FileInfo().IsDir() {
+			if err := os.MkdirAll(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		out, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(out, tr); err != nil {
+			t.Fatal(err)
+		}
+		out.Close()
+	}
+}
+
+func TestAppointmentsRealHost_7208(t *testing.T) {
+	artifact := os.Getenv("APPT_ARTIFACT")
+	if artifact == "" {
+		t.Skip("APPT_ARTIFACT not set (run scripts/realhost.sh in ut-plugin-page-appointments)")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	prev := paths.DataDir()
+	paths.Init(root)
+	t.Cleanup(func() { closeAllPluginData(); paths.Init(prev) })
+
+	database, err := db.Open(filepath.Join(root, "till.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	dbPath := filepath.Join(root, "till.db")
+
+	// 1. unpack the packaged artifact and run the REAL manifest validator on it
+	stage := t.TempDir()
+	apptExtract(t, artifact, stage)
+	mf, err := os.Open(filepath.Join(stage, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := ParseManifest(mf)
+	mf.Close()
+	if err != nil {
+		t.Fatalf("the till's manifest validator refuses the manifest: %v", err)
+	}
+	id := m.ID
+	if m.DB == nil || m.DB.Migrations != "db/migrations" || m.Retention == nil || m.Retention.KeepYears < 1 {
+		t.Fatalf("manifest db/retention = %+v / %+v", m.DB, m.Retention)
+	}
+	if len(m.Schedules) != 1 || !strings.HasPrefix(m.Schedules[0].Event, id+".") {
+		t.Fatalf("schedules = %+v", m.Schedules)
+	}
+	// seedPlugin registers version 1.0.0 (a test fixture); the code tree sits
+	// where the host looks for the active version.
+	const seededVersion = "1.0.0"
+	codeDir := filepath.Join(root, "plugins", id, seededVersion)
+	if err := os.MkdirAll(filepath.Dir(codeDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(stage, codeDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. install: seed the plugin row, grant exactly the declared permissions,
+	// then the real install-time migration path.
+	seedPlugin(t, database.DB, id)
+	grantPerm(t, database.DB, id, "storage")
+	for _, p := range m.Permissions {
+		grantPerm(t, database.DB, id, p)
+	}
+	up, err := migrateDataForInstall(ctx, m, codeDir, "")
+	if err != nil {
+		t.Fatalf("migrations on install: %v", err)
+	}
+	if up == nil {
+		t.Fatal("no upgrade handle: the db block was ignored")
+	}
+	// the catalogue the plugin prices from
+	if _, err := database.DB.Exec(`INSERT INTO items(id, sku, name, base_price, is_active) VALUES('itm-cut','cut','Haircut', 2500, 1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	wasm := filepath.Join(codeDir, "bin", "plugin.wasm")
+	send := func(typ string, payload any) (string, error) {
+		t.Helper()
+		w := NewWasmRuntime(t.TempDir())
+		defer w.Close(ctx)
+		if err := w.load(id, seededVersion, wasm); err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		w.mu.Lock()
+		w.db = database.DB
+		w.mu.Unlock()
+		body, _ := json.Marshal(payload)
+		out, err := w.HandleEvent(ctx, id, Event{ID: "ev", Type: typ, Timestamp: time.Now(), Payload: body})
+		return string(out), err
+	}
+	must := func(typ string, payload any) string {
+		t.Helper()
+		out, err := send(typ, payload)
+		if err != nil {
+			t.Fatalf("%s: %v", typ, err)
+		}
+		return out
+	}
+	view := func(v string, params map[string]string) string {
+		return must("ui.view.ask", map[string]any{"view": v, "locale": "en", "params": params})
+	}
+	act := func(v, a string, form map[string]any) string {
+		return must("ui.action.ask", map[string]any{"view": v, "action": a, "locale": "en", "form": form})
+	}
+
+	// 3. set up through the admin pages, book through the calendar
+	out := act("appointments.resources", "save_resource", map[string]any{"resource": "_new", "name": "Ana", "kind": "staff", "status": "active"})
+	rid := regexp.MustCompile(`"value":"([0-9a-f-]{36})"`).FindStringSubmatch(out)
+	if rid == nil {
+		t.Fatalf("no resource id in %s", out)
+	}
+	for wd := 0; wd < 7; wd++ {
+		act("appointments.hours", "add_hours", map[string]any{"resource": rid[1], "weekday": strconv.Itoa(wd), "start": "09:00", "end": "17:00"})
+	}
+	if o := act("appointments.services", "save_service", map[string]any{"sku": "cut", "duration_min": "30", "buffer_min": "5", "all_resources": true, "active": true}); strings.Contains(o, "error") {
+		t.Fatalf("save_service: %s", o)
+	}
+	loc, _ := time.LoadLocation("Europe/London")
+	tomorrow := time.Now().In(loc).AddDate(0, 0, 1)
+	start := time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 10, 0, 0, 0, loc).UTC()
+	date := tomorrow.Format("2006-01-02")
+	book := act("appointments.day", "create", map[string]any{"staff": rid[1], "service": "cut", "date": date, "first_name": "Zoe", "time": start.Format(time.RFC3339)})
+	if !strings.Contains(book, "Zoe") {
+		t.Fatalf("booking not shown: %s", book)
+	}
+	if o := act("appointments.day", "queue_add", map[string]any{"first_name": "Kim", "service": "cut", "staff": "any"}); !strings.Contains(o, "Kim added") {
+		t.Fatalf("queue_add: %s", o)
+	}
+	day := func() string { return view("appointments.day", map[string]string{"date": date}) }
+	if d := day(); !strings.Contains(d, "Zoe") || !strings.Contains(d, "Haircut") {
+		t.Fatalf("day view after booking: %s", d)
+	}
+	// the purge schedule tick runs clean
+	if _, err := send(m.Schedules[0].Event, map[string]any{}); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	// db:own is re-checked on every call: revoking it stops the plugin
+	repo := data.NewPluginRepo(database.DB)
+	if err := repo.SetPermission(ctx, id, "db:own", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := send("ui.view.ask", map[string]any{"view": "appointments.day", "locale": "en"}); err == nil {
+		t.Error("the calendar still answered without db:own")
+	}
+	if err := repo.SetPermission(ctx, id, "db:own", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. rows survive: a fresh runtime, then a real backup -> wipe -> restore
+	closeAllPluginData()
+	if d := day(); !strings.Contains(d, "Zoe") {
+		t.Fatalf("booking lost after reopening the database: %s", d)
+	}
+	closeAllPluginData()
+	snap, err := db.SnapshotWithAssets(database.DB, dbPath, filepath.Join(root, "public", "assets"))
+	if err != nil {
+		t.Fatalf("SnapshotWithAssets: %v", err)
+	}
+	pd := filepath.Join(root, "plugin-data")
+	if err := os.RemoveAll(pd); err != nil {
+		t.Fatal(err)
+	}
+	closeAllPluginData()
+	if n, err := db.RestoreBackupPluginData(snap, pd); err != nil || n < 1 {
+		t.Fatalf("RestoreBackupPluginData n=%d err=%v", n, err)
+	}
+	if d := day(); !strings.Contains(d, "Zoe") {
+		t.Fatalf("booking lost across backup and restore: %s", d)
+	}
+
+	// 5. keep_years: uninstall keeps the data aside, the delete-now path is
+	// refused, a reinstall restores the rows.
+	closeAllPluginData()
+	mgr := DataManager()
+	if _, err := mgr.UninstallRetained(id, m.Retention.KeepYears, m.Retention.ReasonKey); err != nil {
+		t.Fatalf("UninstallRetained: %v", err)
+	}
+	if err := mgr.DeleteNow(id); !errors.Is(err, plugindb.ErrRetained) {
+		t.Fatalf("DeleteNow inside keep_years = %v, want ErrRetained", err)
+	}
+	if _, err := migrateDataForInstall(ctx, m, codeDir, ""); err != nil {
+		t.Fatalf("reinstall: %v", err)
+	}
+	if d := day(); !strings.Contains(d, "Zoe") {
+		t.Fatalf("booking lost across uninstall and reinstall: %s", d)
+	}
+}

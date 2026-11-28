@@ -529,3 +529,24 @@ func TestAnswer_MarshalNeedsExactlyOne(t *testing.T) {
 		t.Fatal("double answer marshalled")
 	}
 }
+
+// Another event moved the booking between the decision and the write: the
+// guarded write refuses (ErrGone) and the desk shows a notice, not an error
+// page (fix-plug finding 1).
+func TestTransition_RacedWriteIsANotice(t *testing.T) {
+	f := newFake(t)
+	f.add(t, "a", "st1", engine.Booked, jan14(t, 10, 0), 30, "Ana")
+	f.failNext = ErrGone
+	ans := run(t, newDeps(f), ask("do_checkin_a", jan14(t, 9, 55), cashier, nil))
+	has(t, ans.Document, "no longer there")
+}
+
+// Another event booked the slot between the conflict check and the write: the
+// store's guarded insert refuses with engine.ErrConflict and the cashier gets
+// "no longer free", not an error page (fix-plug finding 2).
+func TestCreate_RacedSlotIsANotice(t *testing.T) {
+	f := newFake(t)
+	f.failNext = engine.ErrConflict
+	ans := run(t, newDeps(f), ask("create", now8(), cashier, createForm("st1", "cut", "2026-01-14", "Ana", iso(jan14(t, 10, 0)))))
+	has(t, ans.Document, "no longer free")
+}

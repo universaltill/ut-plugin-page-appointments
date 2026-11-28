@@ -1,17 +1,19 @@
 // Package store is the plugin's persistence layer: SQL migrations, a
 // repository over a small DB interface, retention purge and input validation.
 //
-// The plugin-callable database does not exist on the till yet (owner card
-// ut-docs#3157). The repository is written against DB, which has the same
-// shape as the host's plugindb Store (Exec returns rows affected, Query
-// returns a JSON array of row objects), so the host function can be plugged in
-// when it lands. Nothing here fakes the till: tests use memdb (statement
-// level double) and, where the sqlite3 command is installed, real SQLite.
+// The repository is written against DB, which has the shape of the host's
+// plugindb Store (Exec returns rows affected, Query returns a JSON array of
+// row objects). On a till it runs over the host functions db_exec / db_query
+// (ABI 2, ut-docs#3157; package hostdb). Tests use memdb (a statement-level
+// double) and, where the sqlite3 command is installed, real SQLite; the
+// packaged artifact is also run against the real host (scripts/realhost.sh).
 //
 // The host runs one statement per call and refuses BEGIN/COMMIT, so no write
-// is atomic across statements. Every multi-statement write is ordered so that
-// a crash leaves either nothing visible or a state Reconcile repairs, and a
-// retry is idempotent (see Repository).
+// is atomic across statements. Writes are ordered so that a crash leaves
+// either nothing visible or a state Reconcile repairs, and a retry is
+// idempotent (see Repository). Two writes are not repaired automatically: the
+// delete-then-insert of working hours and of a service's resources; a crash
+// between the two leaves partial hours until the form is saved again.
 package store
 
 import (
