@@ -14,5 +14,11 @@ published until ADR-0221 is accepted and the owner enables publishing.
 - `scripts/realhost.sh /path/to/universal-till`: runs the packaged artifact
   against the real till host (manifest validator, install migrations, wasm
   guest, backup and restore, `keep_years` retention).
+- Replicas (ut-docs#7207): the main till publishes a read-only `calendar`
+  snapshot (`snapshot_set`, on every change and on the 15-minute tick); a
+  replica till shows it as a read-only day calendar and writes nothing. The
+  manifest declares `records:sync` and `records_forward.snapshots`.
+- Retention purge: the schedule tick blanks expired names; opening the
+  calendar only clears yesterday's walk-in queue (#7268).
 - Not yet: provider calendars, deposits, reminders, the basket seam (the till
   does not yet echo a per-line `ref`, so completion is by picking the receipt).

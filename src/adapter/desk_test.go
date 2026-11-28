@@ -150,3 +150,21 @@ func TestEraseBlanksTheChainAndNeedsManager(t *testing.T) {
 		t.Fatal("the name is still in the database")
 	}
 }
+
+type deniedRecs struct{ recs }
+
+func (deniedRecs) Recent() ([]calendar.Receipt, error) { return nil, calendar.ErrReceiptsDenied }
+
+// #7267: a role without view:sales gets a plain notice in the picker, not an
+// error page, and the visit stays in service.
+func TestReceiptPickerDeniedShowsNotice(t *testing.T) {
+	r, desk, _, _ := deskRig(t)
+	desk.Source = deniedRecs{}
+	b := r.bookAt(10, "Ana")
+	r.clk.t = time.Date(2026, 1, 14, 10, 0, 0, 0, time.UTC)
+	r.ask("do_checkin_"+tok(b.ID), mgr, nil)
+	r.ask("do_start_"+tok(b.ID), mgr, nil)
+	if d := r.doc(r.ask("receipt_"+tok(b.ID), mgr, nil)); !strings.Contains(d, "receipts_denied") {
+		t.Fatalf("no denied notice: %s", d)
+	}
+}

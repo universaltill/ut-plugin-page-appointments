@@ -11,7 +11,7 @@ writer). Manifest contract: ut-docs `reference/plugin-manifest.md`.
   `internal/money` (source file and commit are named in its package comment).
 - `src/snapshot` — pure builder of the read-only `calendar` snapshot the main
   till publishes to replicas (ut-docs design 7207): closed key set, 60 KiB cap.
-  Not wired to `snapshot_set` yet (design only, see the design's section 8).
+  Wired in `src/app/snapshot.go` (publish on change and on the 15-minute tick) and `src/calendar/replica.go` (read-only replica page).
 - `src/store` — repository over a small `DB` interface, migrations
   (`src/store/migrations`, copied to `db/migrations` in the artifact), purge,
   queue, completion outbox. `src/store/memdb` is the test double.

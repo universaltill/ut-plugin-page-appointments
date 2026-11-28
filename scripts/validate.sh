@@ -25,10 +25,11 @@ if m.get("runtime") == "wasm":
     elif not os.path.isfile(ep): errs.append(f"module not found: {ep} (run scripts/build.sh)")
 if m.get("device_arch") != "any": errs.append("device_arch must be 'any'")
 if m.get("canonical_type") != "page": errs.append("canonical_type must be 'page'")
-want = ["events:receive", "ui:page", "db:own", "schedule", "view:sales", "view:inventory", "view:shop"]
+want = ["events:receive", "ui:page", "db:own", "schedule", "view:sales", "view:inventory", "view:shop", "records:sync"]
 if sorted(m.get("permissions", [])) != sorted(want): errs.append(f"permissions must be exactly {want}")
 if any(str(p).startswith("net:") for p in m.get("permissions", [])): errs.append("no net:* permission")
 if sorted(m.get("views_used", [])) != ["catalog.items.v1", "sales.receipts.v1", "shop.context.v2"]: errs.append("views_used mismatch")
+if (m.get("records_forward") or {}) != {"snapshots": ["calendar"]}: errs.append("records_forward must be exactly snapshots [calendar] (design 7207)")
 pid = m.get("id", "")
 for s in m.get("schedules", []):
     if not s.get("event", "").startswith(pid + "."): errs.append("schedule event must start with the plugin id")

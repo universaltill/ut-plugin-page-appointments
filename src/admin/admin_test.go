@@ -666,7 +666,7 @@ func TestAdmin_DefaultCheckFailsClosed(t *testing.T) {
 }
 
 // N10 / N12: the texts claim only what is true. The purge now runs on the
-// schedule tick and before every calendar view (#7208), so the privacy text
+// schedule tick (#7208, #7268), so the privacy text
 // says names are blanked and no longer that blanking is off (fix-plug 4).
 func TestLocale_NoClaimsWithoutAPath(t *testing.T) {
 	raw, err := os.ReadFile("../../locales/en.json")

@@ -104,6 +104,36 @@ func TestEventsRouteToCalendarAdminAndTick(t *testing.T) {
 	}
 }
 
+// countDB counts the statements that scan the appointment table for names.
+type countDB struct {
+	store.DB
+	scans int
+}
+
+func (c *countDB) Query(ctx context.Context, q string, a ...any) ([]byte, error) {
+	if q == store.SQLNamedPage {
+		c.scans++
+	}
+	return c.DB.Query(ctx, q, a...)
+}
+
+// #7268: opening the calendar never scans the appointment table for names
+// (interactive path); the schedule tick does the retention purge.
+func TestCalendarOpenDoesNotScanForPurge(t *testing.T) {
+	r := newRig(t)
+	c := &countDB{DB: r.db}
+	r.h = app.Handlers(app.Deps{DB: c, Catalogue: cat{}, Receipts: rec{}, Pub: &pub{},
+		IDs: func() string { r.n++; return fmt.Sprintf("id-%d", r.n) }})
+	r.send(t, "ui.view.ask", map[string]any{"view": "appointments.day", "locale": "en"})
+	if c.scans != 0 {
+		t.Fatalf("calendar open scanned the table %d times", c.scans)
+	}
+	r.send(t, app.TickEvent, map[string]any{})
+	if c.scans == 0 {
+		t.Fatal("the tick did not run the retention purge")
+	}
+}
+
 func TestAdminIsClosedToCashiers(t *testing.T) {
 	r := newRig(t)
 	out := r.send(t, "ui.view.ask", map[string]any{"view": "appointments.settings", "locale": "en",

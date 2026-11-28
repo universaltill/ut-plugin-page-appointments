@@ -35,6 +35,7 @@ func main() {
 		Catalogue:    hostview.Catalogue{},
 		Receipts:     hostview.Receipts{},
 		Pub:          eventPub{},
+		Records:      app.HostRecords{},
 		ShopCurrency: hostview.ShopCurrency,
 	}))
 }

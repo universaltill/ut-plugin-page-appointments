@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -204,4 +205,49 @@ func TestN11_PurgeEventBeforeBlanking(t *testing.T) {
 	if !strings.Contains(fmt.Sprint(evs2[len(evs2)-1].Reason), store.ReasonRetention) {
 		t.Fatal("reason")
 	}
+}
+
+// raceDB runs hook once, just before the first SQLSetProjection reaches the
+// database: another event got in between the repository's read and write.
+type raceDB struct {
+	store.DB
+	hook func()
+}
+
+func (r *raceDB) Exec(ctx context.Context, q string, a ...any) (int64, error) {
+	if q == store.SQLSetProjection && r.hook != nil {
+		h := r.hook
+		r.hook = nil
+		h()
+	}
+	return r.DB.Exec(ctx, q, a...)
+}
+
+// #7270: undoing a no-show reads the overlap set, then writes. The write is
+// guarded on the state that was read, so when a second manager's undo got in
+// first, the loser gets ErrStale and writes no event (no second
+// conflict_override, no state change over the winner).
+func TestNoShowUndo_WriteIsStateGuarded_7270(t *testing.T) {
+	var rdb *raceDB
+	forEachBackendWith(t, func(d store.DB) store.DB { rdb = &raceDB{DB: d}; return rdb }, func(t *testing.T, e *env) {
+		a := mustCreate(t, e, "r1", at(14, 10, 0), "Ana")
+		e.clk.t = at(14, 10, 16)
+		if _, err := e.repo.Transition(ctx, a.ID, engine.TransitionInput{To: engine.NoShow, ActorUserID: "u1"}); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := e.repo.Events(ctx, a.ID)
+		rdb.hook = func() { // the other manager's undo lands first
+			if n, err := rdb.DB.Exec(ctx, store.SQLSetProjection, a.ID, string(engine.CheckedIn), 0, "", string(engine.NoShow)); err != nil || n != 1 {
+				t.Errorf("racing write: %d %v", n, err)
+			}
+		}
+		_, err := e.repo.Transition(ctx, a.ID, engine.TransitionInput{To: engine.CheckedIn, ActorUserID: "m1", ByManager: true, Reason: "arrived"})
+		if !errors.Is(err, store.ErrStale) {
+			t.Fatalf("want ErrStale, got %v", err)
+		}
+		after, _ := e.repo.Events(ctx, a.ID)
+		if len(after) != len(before) {
+			t.Fatalf("the loser wrote events: %+v", after[len(before):])
+		}
+	})
 }

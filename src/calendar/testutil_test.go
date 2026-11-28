@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/universaltill/ut-plugin-page-appointments/locales"
 	"sort"
 	"strings"
 	"testing"
@@ -180,7 +181,7 @@ func text(d *Document) string {
 	b, _ := json.Marshal(d)
 	var sb strings.Builder
 	sb.Write(b)
-	for k, v := range bundles["en"] {
+	for k, v := range locales.Bundles()["en"] {
 		if strings.Contains(string(b), `"key":"`+k+`"`) {
 			sb.WriteString(" " + v)
 		}

@@ -224,3 +224,36 @@ func Changed(prev, next []byte, now time.Time) bool {
 	b, err2 := json.Marshal(n)
 	return err1 != nil || err2 != nil || string(a) != string(b)
 }
+
+// Payload, Resource and Row are the decoded snapshot a replica reads
+// (snapshot_get). The fields are the closed key set of the wire format.
+type (
+	Payload  = payload
+	Resource = resourceOut
+	Row      = apptOut
+)
+
+// Decode reads snapshot bytes. A version other than Version is refused: an
+// older plugin never guesses at a newer payload.
+func Decode(raw []byte) (Payload, error) {
+	var p payload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return payload{}, err
+	}
+	if p.V != Version {
+		return payload{}, errors.New("snapshot: unsupported version")
+	}
+	return p, nil
+}
+
+// Times parses the payload's instants (as_of, from_utc, to_utc).
+func (p payload) Times() (asOf, from, to time.Time, err error) {
+	if asOf, err = time.Parse(time.RFC3339, p.AsOf); err != nil {
+		return
+	}
+	if from, err = time.Parse(time.RFC3339, p.FromUTC); err != nil {
+		return
+	}
+	to, err = time.Parse(time.RFC3339, p.ToUTC)
+	return
+}
