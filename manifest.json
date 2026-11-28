@@ -1,0 +1,22 @@
+{
+  "id": "com.universaltill.page-appointments",
+  "name": "Appointments",
+  "version": "0.1.0",
+  "description": "Own appointment calendar for service shops: scheduling engine (slice 1, no UI yet).",
+  "author": "Universal Till",
+  "website": "https://universaltill.com",
+  "canonical_type": "page",
+  "runtime": "wasm",
+  "device_arch": "any",
+  "min_pos_version": "1.0.0",
+  "countries": [
+    "GB"
+  ],
+  "permissions": [
+    "events:receive"
+  ],
+  "locales": [
+    "en-GB"
+  ],
+  "entrypoint": "./bin/plugin.wasm"
+}
