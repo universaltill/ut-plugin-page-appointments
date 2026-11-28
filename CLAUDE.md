@@ -9,6 +9,9 @@ writer). Manifest contract: ut-docs `reference/plugin-manifest.md`.
 - `src/engine` — pure scheduling core (availability, conflicts, state machine,
   walk-in queue, deposit arithmetic). `src/money` — vendored copy of core's
   `internal/money` (source file and commit are named in its package comment).
+- `src/snapshot` — pure builder of the read-only `calendar` snapshot the main
+  till publishes to replicas (ut-docs design 7207): closed key set, 60 KiB cap.
+  Not wired to `snapshot_set` yet (design only, see the design's section 8).
 - `src/main.go` — WASI command (`//go:build wasip1`); imports `time/tzdata`
   because a wasip1 guest has no system zoneinfo. It does not call the engine yet.
 
