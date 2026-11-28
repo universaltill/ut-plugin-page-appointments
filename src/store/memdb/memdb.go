@@ -149,7 +149,10 @@ func (d *DB) Exec(_ context.Context, q string, a ...any) (int64, error) {
 		}
 		d.tables["appointment_lines"] = append(d.tables["appointment_lines"], r)
 		return 1, nil
-	case store.SQLInsertAppointment:
+	case store.SQLInsertAppointment, store.SQLInsertAppointmentFree:
+		if q == store.SQLInsertAppointmentFree && d.overlapsHolding(a) {
+			return 0, nil
+		}
 		if a[13] != "" && d.find("appointments", func(o rec) bool { return o["supersedes_id"] == a[13] }) >= 0 {
 			return 0, fmt.Errorf("memdb: UNIQUE constraint failed: appointments.supersedes_id")
 		}
@@ -381,4 +384,23 @@ func (d *DB) Dump() string {
 	defer d.mu.Unlock()
 	b, _ := json.Marshal(d.tables)
 	return string(b)
+}
+
+// overlapsHolding is the NOT EXISTS of SQLInsertAppointmentFree.
+func (d *DB) overlapsHolding(a []any) bool {
+	start, end := asInt(a[4]), asInt(a[5])+asInt(a[6])*60
+	return d.find("appointments", func(e rec) bool {
+		if e["resource_id"] != a[3] || e["id"] == a[0] || e["id"] == a[13] {
+			return false
+		}
+		switch e["state"] {
+		case "booked", "confirmed", "checked_in", "in_service":
+		default:
+			return false
+		}
+		if d.find("appointments", func(s rec) bool { return s["supersedes_id"] == e["id"] }) >= 0 {
+			return false
+		}
+		return e["start_utc"].(int64) < end && e["end_utc"].(int64)+e["buffer_min"].(int64)*60 > start
+	}) >= 0
 }

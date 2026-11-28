@@ -553,7 +553,7 @@ func TestCreate_CrashBeforeRowLeavesNothingVisible(t *testing.T) {
 	d := newMem()
 	repo := store.New(d, &clock{t: at(14, 8, 0)}, counter("id"), "till1")
 	d.FailExec = func(q string, _ []any) error {
-		if q == store.SQLInsertAppointment {
+		if q == store.SQLInsertAppointment || q == store.SQLInsertAppointmentFree {
 			return errors.New("crash")
 		}
 		return nil

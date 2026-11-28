@@ -34,13 +34,21 @@ manifest). The host exposes only a UTC offset (`device_timezone_get`), not an
 IANA zone, so the zone cannot be seeded from the till. The currency is seeded
 from `shop.context.v2` the first time a page opens.
 
-## Q4: concurrent writers
+## Q4: concurrent writers (closed in code)
 
-Each event is one wasm instance; the repository mutex orders writes inside one
-event only. The conflict check and the insert are two host calls, so two
-simultaneous operator posts could double-book the same slot. The unique
-`supersedes_id` index closes the double-move case. Closing the booking case
-needs either a single guarded `INSERT ... WHERE NOT EXISTS` statement or the
-host serialising events per plugin; ask the architect whether the host already
-does the latter.
-
+Each event is one wasm instance and the host runs up to 4 events of one
+plugin at once; the repository mutex orders writes inside one event only.
+Now closed in the plugin, no host change needed:
+- a new row that holds time is written with one guarded statement
+  (`SQLInsertAppointmentFree`: `INSERT ... SELECT ... WHERE NOT EXISTS`
+  an overlapping holding row on the same resource); 0 rows = the slot was
+  taken since the check, the cashier sees "no longer free". A manager
+  override (a `conflict_override` event) is written unguarded, as decided.
+- a state change is guarded on the state the decision was made on
+  (`Change.From`, `UPDATE ... WHERE state = from`); a second completion is
+  refused and reported as `other_sale`/`duplicate`, so `sale_ref` and the
+  outbox keep the first completion.
+- the unique `supersedes_id` index closes the double-move case.
+Left: the manager's no-show -> checked-in correction re-checks overlap in a
+separate call (it records a conflict_override whatever it finds, so a race
+there changes only the event's conflicting ids).

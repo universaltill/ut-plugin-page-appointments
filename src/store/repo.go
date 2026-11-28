@@ -539,13 +539,29 @@ func (r *Repository) writeBooking(ctx context.Context, b Booking, events []engin
 			return err
 		}
 	}
-	if _, err := r.db.Exec(ctx, SQLInsertAppointment, b.ID, b.OriginTillID, b.Source, b.ResourceID,
+	// A row that holds time and carries no manager override is written only
+	// if no overlapping row exists at the moment of the write (one guarded
+	// statement): the conflict check the caller ran is a separate call and
+	// another event may have taken the slot since.
+	guarded := b.State.Holds() && !hasOverride(events)
+	q := SQLInsertAppointment
+	if guarded {
+		q = SQLInsertAppointmentFree
+	}
+	n, err := r.db.Exec(ctx, q, b.ID, b.OriginTillID, b.Source, b.ResourceID,
 		b.Start.Unix(), b.End.Unix(), b.BufferMin, b2i(b.WalkIn), string(b.State), b.FirstName, b.Currency,
-		b.SaleRef, b2i(b.LateCancel), b.SupersedesID, b.CreatedAt.Unix()); err != nil {
+		b.SaleRef, b2i(b.LateCancel), b.SupersedesID, b.CreatedAt.Unix())
+	if err != nil {
 		if b.SupersedesID != "" && isUnique(err) {
 			return ErrNotCurrent // a concurrent move already superseded the row
 		}
 		return err
+	}
+	if guarded && n == 0 {
+		// The lines already written stay unreferenced (lines are never
+		// deleted, migration 0002), as after a crash before the row: no
+		// reader lists lines without their row.
+		return engine.ErrConflict
 	}
 	for _, ev := range events {
 		if err := r.insertEvent(ctx, ev); err != nil {
@@ -553,6 +569,15 @@ func (r *Repository) writeBooking(ctx context.Context, b Booking, events []engin
 		}
 	}
 	return nil
+}
+
+func hasOverride(events []engine.Event) bool {
+	for _, e := range events {
+		if e.Kind == engine.KindConflictOverride {
+			return true
+		}
+	}
+	return false
 }
 
 func isUnique(err error) bool {

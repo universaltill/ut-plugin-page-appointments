@@ -26,8 +26,17 @@ const (
 	apptCols = `id, origin_till_id, source, resource_id, start_utc, end_utc, buffer_min, walk_in, state, client_first_name, currency, sale_ref, late_cancel, supersedes_id, created_at`
 
 	SQLInsertAppointment = `INSERT INTO appointments (` + apptCols + `) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`
-	SQLInsertLine        = `INSERT OR IGNORE INTO appointment_lines (appointment_id, line_no, sku, name_snapshot, qty, amount_minor, duration_min, buffer_min) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
-	SQLGetAppointment    = `SELECT ` + apptCols + ` FROM appointments WHERE id = ?1`
+	// SQLInsertAppointmentFree is SQLInsertAppointment guarded, in the same
+	// statement, against an overlapping row on the same resource that holds
+	// time (booked, confirmed, checked_in, in_service; never superseded;
+	// neither the row itself nor the row it supersedes ?14). The host runs
+	// several events of one plugin at once and has no transaction, so the
+	// calendar's conflict check and the write are otherwise two calls: 0 rows
+	// affected means another event took the slot in between. The overlap is
+	// the engine's: [start, end + buffer) meets [?5, ?6 + ?7 min).
+	SQLInsertAppointmentFree = `INSERT INTO appointments (` + apptCols + `) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15 WHERE NOT EXISTS (SELECT 1 FROM appointments e WHERE e.resource_id = ?4 AND e.id <> ?1 AND e.id <> ?14 AND e.state IN ('booked', 'confirmed', 'checked_in', 'in_service') AND e.start_utc < ?6 + ?7 * 60 AND e.end_utc + e.buffer_min * 60 > ?5 AND NOT EXISTS (SELECT 1 FROM appointments s WHERE s.supersedes_id = e.id))`
+	SQLInsertLine            = `INSERT OR IGNORE INTO appointment_lines (appointment_id, line_no, sku, name_snapshot, qty, amount_minor, duration_min, buffer_min) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+	SQLGetAppointment        = `SELECT ` + apptCols + ` FROM appointments WHERE id = ?1`
 	// SQLListCurrent returns the non-superseded rows whose hold interval
 	// [start, end + buffer) meets [?1, ?2); ?3 is a resource id or ''.
 	SQLListCurrent   = `SELECT ` + apptCols + ` FROM appointments a WHERE a.end_utc + a.buffer_min * 60 > ?1 AND a.start_utc < ?2 AND (?3 = '' OR a.resource_id = ?3) AND NOT EXISTS (SELECT 1 FROM appointments s WHERE s.supersedes_id = a.id) ORDER BY a.start_utc, a.id`

@@ -433,6 +433,9 @@ func (e *env) place(a Ask, moveID string) (*Document, error) {
 		ch.Superseded = p.moveOld.ID
 	}
 	if err := e.deps.Store.Commit(ch); err != nil {
+		if errors.Is(err, engine.ErrConflict) { // another event took the slot since the check
+			return e.retry(a, moveID, p, e.errNotice(errSlotTaken))
+		}
 		return nil, err
 	}
 	msg := "appt.cal.booked"

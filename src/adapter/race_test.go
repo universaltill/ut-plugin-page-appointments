@@ -77,3 +77,19 @@ func TestSecondCompletionDoesNotOverwriteSaleRef(t *testing.T) {
 		t.Fatalf("outbox = %+v", pend)
 	}
 }
+
+// Two events checked the same free slot; the first wrote it. The second's
+// insert is refused by the guarded statement (fix-plug finding 2).
+func TestInsertRefusedWhenSlotTakenAfterCheck(t *testing.T) {
+	r := newRig(t)
+	b := r.bookAt(10, "Ana")
+	dup := b.Appointment
+	dup.ID, dup.SupersedesID = "other-1", ""
+	err := r.st.Commit(calendar.Change{Insert: &calendar.Booking{Appointment: dup, FirstName: "Bea"}})
+	if !errors.Is(err, engine.ErrConflict) {
+		t.Fatalf("double booking: %v", err)
+	}
+	if _, ok, _ := r.st.Booking("other-1"); ok {
+		t.Fatal("second row written")
+	}
+}

@@ -270,6 +270,9 @@ func (e *env) queueSeat(tk string) (*Document, error) {
 		}
 		b := Booking{Appointment: walk, FirstName: w.FirstName}
 		if err := e.deps.Store.Commit(Change{Insert: &b, Events: []engine.Event{ev}, Dequeue: w.ID}); err != nil {
+			if errors.Is(err, engine.ErrConflict) { // another event took the chair since the check
+				return e.dayDocument(e.today(), e.errNotice(errSlotTaken))
+			}
 			return nil, err
 		}
 		return e.dayDocument(e.date(est.Start), notice("info", e.t.lit("appt.cal.q_seated", e.queueName(w), e.staffName(est.ResourceID))))
