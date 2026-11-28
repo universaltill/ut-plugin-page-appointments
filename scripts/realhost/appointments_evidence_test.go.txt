@@ -1,0 +1,625 @@
+package plugins
+
+// COPIED into the till's internal/plugins by scripts/realhost.sh next to
+// appointments_realhost_test.go.txt (it reuses apptExtract); never committed
+// there. Acceptance evidence for ut-docs#7113 and #7114: every AC of both
+// cards is one test here (docs/evidence-7113-7114.md maps AC -> test). Real
+// manifest validator, real install-time migrations, the packaged wasm guest on
+// the real wazero host with the real db_exec/db_query/view_query host
+// functions. Run ONE at a time:
+//
+//	APPT_ARTIFACT=... go test ./internal/plugins -run TestApptEvidence_Privacy_7113_7114
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/universaltill/universal-till/internal/db"
+	"github.com/universaltill/universal-till/internal/db/plugindb"
+	"github.com/universaltill/universal-till/internal/paths"
+)
+
+type apptEv struct {
+	t        *testing.T
+	ctx      context.Context
+	root     string
+	id       string
+	m        *Manifest
+	codeDir  string
+	wasm     string
+	database *db.DB
+	date     string // tomorrow, shop zone
+	loc      *time.Location
+	staff    string
+	outputs  []string // every document the guest answered, for the key check
+}
+
+func newApptEv(t *testing.T) *apptEv {
+	t.Helper()
+	artifact := os.Getenv("APPT_ARTIFACT")
+	if artifact == "" {
+		t.Skip("APPT_ARTIFACT not set (run scripts/realhost.sh in ut-plugin-page-appointments)")
+	}
+	h := &apptEv{t: t, ctx: context.Background(), root: t.TempDir()}
+	prev := paths.DataDir()
+	paths.Init(h.root)
+	t.Cleanup(func() { closeAllPluginData(); paths.Init(prev) })
+	var err error
+	if h.database, err = db.Open(filepath.Join(h.root, "till.db")); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { h.database.Close() })
+	stage := t.TempDir()
+	apptExtract(t, artifact, stage)
+	mf, err := os.Open(filepath.Join(stage, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.m, err = ParseManifest(mf)
+	mf.Close()
+	if err != nil {
+		t.Fatalf("manifest validator: %v", err)
+	}
+	h.id = h.m.ID
+	h.codeDir = filepath.Join(h.root, "plugins", h.id, "1.0.0")
+	if err := os.MkdirAll(filepath.Dir(h.codeDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(stage, h.codeDir); err != nil {
+		t.Fatal(err)
+	}
+	h.wasm = filepath.Join(h.codeDir, "bin", "plugin.wasm")
+	h.loc, _ = time.LoadLocation("Europe/London")
+	h.date = time.Now().In(h.loc).AddDate(0, 0, 1).Format("2006-01-02")
+	return h
+}
+
+// install seeds the plugin row, grants exactly the declared permissions and
+// runs the real install-time migration path.
+func (h *apptEv) install() {
+	h.t.Helper()
+	seedPlugin(h.t, h.database.DB, h.id)
+	grantPerm(h.t, h.database.DB, h.id, "storage")
+	for _, p := range h.m.Permissions {
+		grantPerm(h.t, h.database.DB, h.id, p)
+	}
+	if up, err := migrateDataForInstall(h.ctx, h.m, h.codeDir, ""); err != nil || up == nil {
+		h.t.Fatalf("migrations on install: %v (up=%v)", err, up)
+	}
+	if _, err := h.database.DB.Exec(`INSERT INTO items(id, sku, name, base_price, is_active) VALUES('itm-cut','cut','Haircut', 2500, 1)`); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *apptEv) send(typ string, payload any) (string, error) {
+	h.t.Helper()
+	w := NewWasmRuntime(h.t.TempDir())
+	defer w.Close(h.ctx)
+	if err := w.load(h.id, "1.0.0", h.wasm); err != nil {
+		h.t.Fatalf("load: %v", err)
+	}
+	w.mu.Lock()
+	w.db = h.database.DB
+	w.mu.Unlock()
+	body, _ := json.Marshal(payload)
+	out, err := w.HandleEvent(h.ctx, h.id, Event{ID: "ev", Type: typ, Timestamp: time.Now(), Payload: body})
+	h.outputs = append(h.outputs, string(out))
+	return string(out), err
+}
+
+func (h *apptEv) must(typ string, payload any) string {
+	h.t.Helper()
+	out, err := h.send(typ, payload)
+	if err != nil {
+		h.t.Fatalf("%s: %v", typ, err)
+	}
+	return out
+}
+
+func (h *apptEv) view(v string, params map[string]string) string {
+	return h.must("ui.view.ask", map[string]any{"view": v, "locale": "en", "params": params})
+}
+
+func (h *apptEv) act(v, a string, form map[string]any) string {
+	return h.must("ui.action.ask", map[string]any{"view": v, "action": a, "locale": "en", "form": form})
+}
+
+func (h *apptEv) day() string { return h.view("appointments.day", map[string]string{"date": h.date}) }
+
+func (h *apptEv) at(hh, mm int) string {
+	d, _ := time.Parse("2006-01-02", h.date)
+	return time.Date(d.Year(), d.Month(), d.Day(), hh, mm, 0, 0, h.loc).UTC().Format(time.RFC3339)
+}
+
+// setup: one staff member open 09-17 every day, one 30 min + 5 min service.
+func (h *apptEv) setup() {
+	h.t.Helper()
+	out := h.act("appointments.resources", "save_resource", map[string]any{"resource": "_new", "name": "Ana", "kind": "staff", "status": "active"})
+	rid := regexp.MustCompile(`"value":"([0-9a-f-]{36})"`).FindStringSubmatch(out)
+	if rid == nil {
+		h.t.Fatalf("no resource id in %s", out)
+	}
+	h.staff = rid[1]
+	for wd := 0; wd < 7; wd++ {
+		h.act("appointments.hours", "add_hours", map[string]any{"resource": h.staff, "weekday": strconv.Itoa(wd), "start": "09:00", "end": "17:00"})
+	}
+	if o := h.act("appointments.services", "save_service", map[string]any{"sku": "cut", "duration_min": "30", "buffer_min": "5", "all_resources": true, "active": true}); strings.Contains(o, "error") {
+		h.t.Fatalf("save_service: %s", o)
+	}
+}
+
+func (h *apptEv) create(name string, hh, mm int, extra map[string]any) string {
+	f := map[string]any{"staff": h.staff, "service": "cut", "date": h.date, "first_name": name, "time": h.at(hh, mm)}
+	for k, v := range extra {
+		f[k] = v
+	}
+	return h.act("appointments.day", "create", f)
+}
+
+// plugin database access (the host's own store, no guest involved)
+func (h *apptEv) store() *plugindb.Store {
+	h.t.Helper()
+	s, err := DataManager().Open(h.ctx, h.id, plugindb.Options{NoMigrate: true})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return s
+}
+
+// rows reads the plugin database FILE directly with a separate read-only
+// connection: the host's own Query refuses _ut_* and sqlite_master, and the
+// evidence must be able to look at everything.
+func (h *apptEv) rows(q string, args ...any) string {
+	h.t.Helper()
+	p := filepath.Join(h.root, "plugin-data", h.id, plugindb.DBFileName)
+	d, err := sql.Open("sqlite", "file:"+p+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer d.Close()
+	rs, err := d.QueryContext(h.ctx, q, args...)
+	if err != nil {
+		h.t.Fatalf("query %q: %v", q, err)
+	}
+	defer rs.Close()
+	cols, _ := rs.Columns()
+	out := []map[string]any{}
+	for rs.Next() {
+		vals := make([]any, len(cols))
+		ptr := make([]any, len(cols))
+		for i := range vals {
+			ptr[i] = &vals[i]
+		}
+		if err := rs.Scan(ptr...); err != nil {
+			h.t.Fatal(err)
+		}
+		row := map[string]any{}
+		for i, c := range cols {
+			if b, ok := vals[i].([]byte); ok {
+				vals[i] = string(b)
+			}
+			if n, ok := vals[i].(int64); ok {
+				vals[i] = float64(n)
+			}
+			row[c] = vals[i]
+		}
+		out = append(out, row)
+	}
+	b, _ := json.Marshal(out)
+	return string(b)
+}
+
+func (h *apptEv) count(q string, args ...any) int {
+	h.t.Helper()
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(h.rows(q, args...)), &rows); err != nil || len(rows) != 1 {
+		h.t.Fatalf("count %q: %v %v", q, err, rows)
+	}
+	for _, v := range rows[0] {
+		return int(v.(float64))
+	}
+	return -1
+}
+
+func mustContain(t *testing.T, what, got string, want ...string) {
+	t.Helper()
+	for _, w := range want {
+		if !strings.Contains(got, w) {
+			t.Fatalf("%s: missing %q in %s", what, w, got)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #7113 AC1: migrations apply and roll forward.
+func TestApptEvidence_Migrations_7113(t *testing.T) {
+	h := newApptEv(t)
+	migs, err := plugindb.LoadMigrations(os.DirFS(h.codeDir), h.m.DB.Migrations)
+	if err != nil || len(migs) < 3 {
+		t.Fatalf("LoadMigrations: %d %v", len(migs), err)
+	}
+	mgr := DataManager()
+	opt := func(ms []plugindb.Migration) plugindb.Options {
+		return plugindb.Options{Migrations: ms, KeepYears: h.m.Retention.KeepYears}
+	}
+	// fresh install at the first two migrations (an "old" version)
+	if _, err := mgr.MigrateForInstall(h.ctx, h.id, "", "0.1.0", opt(migs[:2])); err != nil {
+		t.Fatalf("apply 1..2: %v", err)
+	}
+	if n := h.count(`SELECT count(*) FROM _ut_migrations`); n != 2 {
+		t.Fatalf("applied = %d, want 2", n)
+	}
+	if n := h.count(`SELECT count(*) FROM sqlite_master WHERE name='walkin_queue'`); n != 0 {
+		t.Fatal("0003 objects exist before 0003 ran")
+	}
+	// data written at the old version
+	if _, err := h.store().Exec(h.ctx, `INSERT INTO resources(id,kind,display_name,status) VALUES('r-old','staff','Old Ana','active')`); err != nil {
+		t.Fatal(err)
+	}
+	// roll forward to all migrations: data survives, new objects appear, checksums pinned
+	if _, err := mgr.MigrateForInstall(h.ctx, h.id, "0.1.0", "0.2.0", opt(migs)); err != nil {
+		t.Fatalf("roll forward: %v", err)
+	}
+	if n := h.count(`SELECT count(*) FROM _ut_migrations`); n != len(migs) {
+		t.Fatalf("applied = %d, want %d", n, len(migs))
+	}
+	if n := h.count(`SELECT count(*) FROM resources WHERE id='r-old' AND display_name='Old Ana'`); n != 1 {
+		t.Fatal("row written before the roll-forward was lost")
+	}
+	for _, tbl := range []string{"resources", "working_hours", "time_off", "services", "appointments", "appointment_lines", "appointment_events", "walkin_queue", "completion_outbox"} {
+		if n := h.count(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, tbl); n != 1 {
+			t.Errorf("table %s missing after roll-forward", tbl)
+		}
+	}
+	for _, m := range migs {
+		if n := h.count(`SELECT count(*) FROM _ut_migrations WHERE version=? AND checksum=?`, m.Version, m.Checksum()); n != 1 {
+			t.Errorf("migration %d checksum not pinned", m.Version)
+		}
+	}
+	// re-applying the same set is a no-op (idempotent upgrade)
+	if _, err := mgr.MigrateForInstall(h.ctx, h.id, "0.2.0", "0.2.1", opt(migs)); err != nil {
+		t.Fatalf("re-apply: %v", err)
+	}
+	if n := h.count(`SELECT count(*) FROM _ut_migrations`); n != len(migs) {
+		t.Fatalf("re-apply changed the applied set: %d", n)
+	}
+	// a modified applied migration fails closed and leaves the DB alone
+	bad := append([]plugindb.Migration(nil), migs...)
+	bad[0].SQL += "\n-- tampered\n"
+	if _, err := mgr.MigrateForInstall(h.ctx, h.id, "0.2.1", "0.2.2", opt(bad)); !errors.Is(err, plugindb.ErrMigrationTampered) {
+		t.Fatalf("tampered migration = %v, want ErrMigrationTampered", err)
+	}
+	// a downgrade (artifact carries fewer migrations than applied) is refused
+	if _, err := mgr.MigrateForInstall(h.ctx, h.id, "0.2.1", "0.1.0", opt(migs[:2])); !errors.Is(err, plugindb.ErrMigrationBehind) {
+		t.Fatalf("downgrade = %v, want ErrMigrationBehind", err)
+	}
+	if n := h.count(`SELECT count(*) FROM resources WHERE id='r-old'`); n != 1 {
+		t.Fatal("refused upgrades changed the data")
+	}
+	// the host's pre-upgrade copy rolls the database back to the old shape and
+	// a later roll-forward works again with the data kept
+	if _, err := mgr.RestorePreUpgrade(h.ctx, h.id, "0.1.0"); err != nil {
+		t.Fatalf("RestorePreUpgrade: %v", err)
+	}
+	if n := h.count(`SELECT count(*) FROM _ut_migrations`); n != 2 {
+		t.Fatalf("after rollback applied = %d, want 2", n)
+	}
+	if _, err := mgr.MigrateForInstall(h.ctx, h.id, "0.1.0", "0.2.0", opt(migs)); err != nil {
+		t.Fatalf("roll forward again: %v", err)
+	}
+	if n := h.count(`SELECT count(*) FROM resources WHERE id='r-old'`); n != 1 {
+		t.Fatal("row lost across rollback and second roll-forward")
+	}
+}
+
+// #7113 "records append-only (superseding rows)", #7114 move = superseding row.
+func TestApptEvidence_AppendOnly_7113(t *testing.T) {
+	h := newApptEv(t)
+	h.install()
+	h.setup()
+	mustContain(t, "booking", h.create("Zoe", 10, 0, nil), "Zoe")
+	for _, q := range []string{
+		`UPDATE appointments SET start_utc = start_utc + 60`,
+		`UPDATE appointments SET client_first_name = 'Other'`,
+		`DELETE FROM appointments`,
+		`UPDATE appointment_lines SET qty = 9`,
+		`DELETE FROM appointment_lines`,
+		`UPDATE appointment_events SET reason = 'x'`,
+		`DELETE FROM appointment_events`,
+	} {
+		if _, err := h.store().Exec(h.ctx, q); err == nil {
+			t.Errorf("%q succeeded; the table must be append-only", q)
+		}
+	}
+	if n := h.count(`SELECT count(*) FROM appointments`); n != 1 {
+		t.Fatalf("appointments = %d after refused mutations", n)
+	}
+}
+
+// #7113 AC2 and #7114 AC4: a DB dump contains no phone, email or notes.
+func TestApptEvidence_Privacy_7113_7114(t *testing.T) {
+	h := newApptEv(t)
+	h.install()
+	h.setup()
+	const phone, email, note = "07700900123", "zoe.test@example.com", "allergic to latex"
+	// PII typed into the name is refused with a visible reason ...
+	for _, bad := range []string{"Zoe " + phone, email, "Zoe 2"} {
+		o := h.create(bad, 10, 0, nil)
+		mustContain(t, "refused name "+bad, o, "appt.cal.err.name_invalid")
+	}
+	if n := h.count(`SELECT count(*) FROM appointments`); n != 0 {
+		t.Fatalf("a refused booking left %d rows", n)
+	}
+	// ... and extra form fields (phone, email, notes) are dropped, not stored
+	mustContain(t, "booking", h.create("Zoe", 10, 0, map[string]any{
+		"phone": phone, "email": email, "notes": note, "note": note, "mobile": phone, "override_reason": note,
+	}), "Zoe")
+	mustContain(t, "walk-in", h.act("appointments.day", "queue_add", map[string]any{"first_name": "Kim", "service": "cut", "staff": "any", "phone": phone, "notes": note}), "Kim added")
+
+	// schema: no column that could hold contact data or free-text notes
+	var cols []map[string]any
+	if err := json.Unmarshal([]byte(h.rows(`SELECT m.name AS tbl, p.name AS col FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type='table'`)), &cols); err != nil || len(cols) < 40 {
+		t.Fatalf("columns: %v (%d)", err, len(cols))
+	}
+	banned := regexp.MustCompile(`(?i)phone|mobile|tel|e_?mail|note|comment|address|surname|last_?name|dob|birth`)
+	for _, c := range cols {
+		if banned.MatchString(c["col"].(string)) {
+			t.Errorf("column %v.%v can hold contact data or notes", c["tbl"], c["col"])
+		}
+	}
+	// every row of every table, as JSON
+	var tables []map[string]any
+	_ = json.Unmarshal([]byte(h.rows(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)), &tables)
+	var dump strings.Builder
+	for _, tb := range tables {
+		dump.WriteString(h.rows(`SELECT * FROM "` + tb["name"].(string) + `"`))
+	}
+	mustContain(t, "positive control (the first name IS stored)", dump.String(), "Zoe", "Kim")
+	// raw database bytes after a checkpoint, plus any wal
+	if err := h.store().Checkpoint(h.ctx); err != nil {
+		t.Fatal(err)
+	}
+	closeAllPluginData()
+	raw := dump.String()
+	files, _ := filepath.Glob(filepath.Join(h.root, "plugin-data", h.id, "plugin.db*"))
+	if len(files) == 0 {
+		t.Fatal("no plugin database file found")
+	}
+	for _, f := range files {
+		b, _ := os.ReadFile(f)
+		raw += string(b)
+	}
+	for _, s := range []string{phone, "7700900123", email, "example.com", note, "latex"} {
+		if strings.Contains(raw, s) {
+			t.Errorf("the database holds %q", s)
+		}
+	}
+}
+
+// #7113 AC3 (admin pages offline) and #7114 AC3/AC5 (no network): the plugin
+// asks for no network permission and never touches the host's egress client
+// while it runs the admin pages and the whole booking flow.
+func TestApptEvidence_Offline_7113_7114(t *testing.T) {
+	h := newApptEv(t)
+	for _, p := range h.m.Permissions {
+		if strings.HasPrefix(p, "net:") || strings.HasPrefix(p, "http") || strings.HasPrefix(p, "tcp") {
+			t.Errorf("manifest asks for network permission %q", p)
+		}
+	}
+	var calls atomic.Int32
+	prev := defaultPluginHTTPClient
+	defaultPluginHTTPClient = &http.Client{Transport: roundTripFn(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, errors.New("network unreachable (test)")
+	})}
+	t.Cleanup(func() { defaultPluginHTTPClient = prev })
+
+	h.install()
+	h.setup() // the admin pages: save resource, hours, service
+	for _, v := range []string{"appointments.resources", "appointments.hours", "appointments.services", "appointments.timeoff", "appointments.settings"} {
+		o := h.view(v, nil)
+		if !strings.Contains(o, `"components"`) || strings.Contains(o, "error.generic") {
+			t.Errorf("admin view %s did not render offline: %s", v, o)
+		}
+	}
+	mustContain(t, "resources page lists the staff member", h.view("appointments.resources", nil), "Ana")
+	mustContain(t, "services page lists the service", h.view("appointments.services", nil), "cut")
+	mustContain(t, "booking", h.create("Zoe", 10, 0, nil), "Zoe")
+	mustContain(t, "day", h.day(), "Zoe", "Haircut")
+	mustContain(t, "today overlay", h.view("appointments.today", nil), `"components"`)
+	// the schedule tick (purge, reconcile) also runs without network
+	if _, err := h.send(h.m.Schedules[0].Event, map[string]any{}); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("the plugin made %d outbound HTTP attempts", n)
+	}
+	// and the host would refuse it anyway: no net: grant exists for the plugin
+	if n := h.countGrants("net:"); n != 0 {
+		t.Fatalf("%d net: grants for the plugin", n)
+	}
+}
+
+type roundTripFn func(*http.Request) (*http.Response, error)
+
+func (f roundTripFn) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func (h *apptEv) countGrants(prefix string) int {
+	h.t.Helper()
+	var n int
+	if err := h.database.DB.QueryRow(`SELECT count(*) FROM plugin_permissions WHERE plugin_id=? AND permission LIKE ? AND granted=1`, h.id, prefix+"%").Scan(&n); err != nil {
+		h.t.Fatalf("grants query: %v", err)
+	}
+	return n
+}
+
+var openTok = regexp.MustCompile(`"action":"open_([0-9a-f_]{36})"`)
+
+// #7114 AC1: create, move and cancel through the UI actions; AC2: an overlap
+// is rejected with a visible reason (and nothing is written).
+func TestApptEvidence_CreateMoveCancelOverlap_7114(t *testing.T) {
+	h := newApptEv(t)
+	h.install()
+	h.setup()
+
+	// create
+	mustContain(t, "create", h.create("Zoe", 10, 0, nil), "Booked", "Zoe", "10:00")
+	d := h.day()
+	mustContain(t, "day after create", d, "Zoe", "Haircut", "10:00")
+	tk := openTok.FindStringSubmatch(d)
+	if tk == nil {
+		t.Fatalf("no open_ action for the booking in %s", d)
+	}
+	id := strings.ReplaceAll(tk[1], "_", "-")
+
+	// overlap: same start and a partial overlap are refused with the reason
+	for _, at := range [][2]int{{10, 0}, {10, 15}} {
+		o := h.create("Max", at[0], at[1], nil)
+		mustContain(t, "overlap at "+strconv.Itoa(at[0])+":"+strconv.Itoa(at[1]), o, `"level":"error"`, "overlaps", "Zoe")
+	}
+	if n := h.count(`SELECT count(*) FROM appointments`); n != 1 {
+		t.Fatalf("a refused overlap wrote rows: %d", n)
+	}
+	if strings.Contains(h.day(), "Max") {
+		t.Fatal("the rejected booking shows on the calendar")
+	}
+
+	// move to 11:00: the guest answers a day view at the new time; the old row
+	// is superseded, never edited
+	mustContain(t, "move form", h.act("appointments.day", "move_"+tk[1], map[string]any{"date": h.date}), "findmove_"+tk[1])
+	mustContain(t, "move times", h.act("appointments.day", "findmove_"+tk[1], map[string]any{"staff": h.staff, "date": h.date}), "domove_"+tk[1], "11:00")
+	moved := h.act("appointments.day", "domove_"+tk[1], map[string]any{"staff": h.staff, "date": h.date, "time": h.at(11, 0)})
+	mustContain(t, "move", moved, "Moved", "11:00")
+	if n := h.count(`SELECT count(*) FROM appointments`); n != 2 {
+		t.Fatalf("a move should leave old+new rows, have %d", n)
+	}
+	if n := h.count(`SELECT count(*) FROM appointments WHERE supersedes_id=?`, id); n != 1 {
+		t.Fatal("the new row does not supersede the old one")
+	}
+	d = h.day()
+	mustContain(t, "day after move", d, "Zoe", "11:00")
+	if strings.Contains(d, "10:00") {
+		t.Errorf("the old slot still shows after the move: %s", d)
+	}
+	// moving onto another booking is refused too
+	mustContain(t, "book Kai", h.create("Kai", 14, 0, nil), "Kai")
+	tk2 := openTok.FindAllStringSubmatch(h.day(), -1)
+	if len(tk2) != 2 {
+		t.Fatalf("expected 2 open actions, got %d", len(tk2))
+	}
+	var zoe string
+	for _, m := range tk2 {
+		if o := h.act("appointments.day", "open_"+m[1], nil); strings.Contains(o, "Zoe") {
+			zoe = m[1]
+		}
+	}
+	o := h.act("appointments.day", "domove_"+zoe, map[string]any{"staff": h.staff, "date": h.date, "time": h.at(14, 0)})
+	mustContain(t, "move onto a booking", o, `"level":"error"`, "overlaps", "Kai")
+
+	// cancel: confirm screen, then the action; the state is an event, the row stays
+	mustContain(t, "cancel confirm", h.act("appointments.day", "ask_cancelc_"+zoe, nil), "do_cancelc_"+zoe)
+	mustContain(t, "cancel", h.act("appointments.day", "do_cancelc_"+zoe, nil), "Client cancels done for Zoe")
+	if n := h.count(`SELECT count(*) FROM appointments WHERE state='cancelled_by_client'`); n != 1 {
+		t.Fatalf("cancelled rows = %d", n)
+	}
+	if n := h.count(`SELECT count(*) FROM appointment_events WHERE to_state='cancelled_by_client'`); n != 1 {
+		t.Fatal("cancel left no event")
+	}
+	// the freed slot can be booked again
+	mustContain(t, "rebook the freed slot", h.create("Ira", 11, 0, nil), "Booked", "Ira")
+
+	// walk-in queue: add, seat
+	mustContain(t, "queue_add", h.act("appointments.day", "queue_add", map[string]any{"first_name": "Kim", "service": "cut", "staff": "any"}), "Kim added")
+	seat := regexp.MustCompile(`"action":"seat_([^"]+)"`).FindStringSubmatch(h.day())
+	if seat == nil {
+		t.Fatal("no seat_ action for the queued walk-in")
+	}
+	if o, err := h.send("ui.action.ask", map[string]any{"view": "appointments.day", "action": "seat_" + seat[1], "locale": "en", "form": map[string]any{"date": h.date}}); err != nil {
+		t.Fatalf("seat: %v", err)
+	} else if strings.Contains(o, "seat_"+seat[1]) {
+		t.Errorf("the walk-in is still offered after seating: %s", o)
+	}
+}
+
+// #7114 "UX pass for touch and long locales", as far as it is machine-checkable:
+// every text key the guest emits resolves in the shipped en.json; a longest
+// allowed name (40 runes, Persian) round-trips and 41 is refused; a long
+// service/staff name renders. Touch-target size and visual layout are the
+// till's renderer: owner item.
+func TestApptEvidence_KeysAndLongText_7114(t *testing.T) {
+	h := newApptEv(t)
+	h.install()
+	h.setup()
+	long40 := strings.Repeat("م", 40)
+	long41 := strings.Repeat("م", 41)
+	if utf8.RuneCountInString(long40) != 40 {
+		t.Fatal("fixture")
+	}
+	mustContain(t, "40-rune RTL name", h.create(long40, 10, 0, nil), long40)
+	mustContain(t, "41-rune name", h.create(long41, 12, 0, nil), "appt.cal.err.name_too_long")
+	d := h.day()
+	mustContain(t, "day", d, long40)
+	tk := openTok.FindStringSubmatch(d)
+	h.act("appointments.day", "open_"+tk[1], nil)
+	h.act("appointments.day", "ask_cancelc_"+tk[1], nil)
+	h.act("appointments.day", "move_"+tk[1], map[string]any{"date": h.date})
+	h.act("appointments.day", "new", map[string]any{"date": h.date})
+	h.act("appointments.day", "today", nil)
+	h.view("appointments.today", nil)
+	for _, v := range []string{"appointments.resources", "appointments.hours", "appointments.services", "appointments.timeoff", "appointments.settings"} {
+		h.view(v, nil)
+	}
+	raw, err := os.ReadFile(filepath.Join(h.codeDir, "locales", "en.json"))
+	if err != nil {
+		t.Fatalf("the artifact has no locales/en.json: %v", err)
+	}
+	var en map[string]string
+	if err := json.Unmarshal(raw, &en); err != nil {
+		t.Fatal(err)
+	}
+	keyRE := regexp.MustCompile(`"key":"([^"]+)"`)
+	seen := map[string]bool{}
+	for _, o := range h.outputs {
+		for _, m := range keyRE.FindAllStringSubmatch(o, -1) {
+			seen[m[1]] = true
+			if _, ok := en[m[1]]; !ok {
+				t.Errorf("key %q is emitted but missing from en.json", m[1])
+			}
+		}
+	}
+	if len(seen) < 25 {
+		t.Errorf("only %d distinct keys seen; the walk is too shallow", len(seen))
+	}
+}
+
+// #7114 (found by this evidence run, ut-docs#7280): two NON-overlapping
+// bookings made in separate events must both be accepted with distinct ids.
+// Fails on a host whose wasm guests get a deterministic random source (every
+// fresh instantiation draws the same "random" UUID, the second insert then
+// collides on the primary key: seen as "no longer free" for an overlap, as a
+// guest exit for a non-overlapping time).
+func TestApptEvidence_DistinctIDs_7114(t *testing.T) {
+	h := newApptEv(t)
+	h.install()
+	h.setup()
+	mustContain(t, "first booking", h.create("Zoe", 10, 0, nil), "Booked", "Zoe")
+	mustContain(t, "second booking, a different time", h.create("Kai", 14, 0, nil), "Booked", "Kai")
+	if n := h.count(`SELECT count(DISTINCT id) FROM appointments`); n != 2 {
+		t.Fatalf("distinct appointment ids = %d, want 2", n)
+	}
+	if n := h.count(`SELECT count(*) FROM appointments WHERE id = resource_id`); n != 0 {
+		t.Fatal("an appointment id equals a resource id: the guest's random source repeats across events")
+	}
+}
