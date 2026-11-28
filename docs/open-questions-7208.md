@@ -52,3 +52,13 @@ Now closed in the plugin, no host change needed:
 Left: the manager's no-show -> checked-in correction re-checks overlap in a
 separate call (it records a conflict_override whatever it finds, so a race
 there changes only the event's conflicting ids).
+
+## Q5: receipt picker on a very busy day
+
+`sales.receipts.v1` is oldest-first only (no order argument). The picker
+finds the newest page by galloping and bisecting over `offset`
+(`hostview.receiptPager`, at most `MaxReceiptCalls` = 14 view calls, inside
+the host's 25 per request). That covers about 12,000 receipts in a business
+day; past that the picker shows an error and `Paid` refuses an older
+receipt. A `newest_first` argument on the view would make this one call;
+ask core if a busier shop ever needs it.

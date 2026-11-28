@@ -9,6 +9,7 @@ package hostview
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,8 +28,14 @@ const (
 	// maxCatalogPages bounds the walk: 20 pages are 10,000 items.
 	maxCatalogPages = 20
 	receiptPage     = 100
-	maxReceiptPages = 5
+	// maxReceiptOffset is the view's offset bound.
+	maxReceiptOffset = 1000000
 )
+
+// MaxReceiptCalls bounds the sales.receipts.v1 calls of one Recent or Paid.
+// The host allows 25 view_query calls per operator request (plugin-views.md
+// Decision 6) and the calendar's catalogue read shares them.
+const MaxReceiptCalls = 14
 
 // Catalogue is adapter.Catalogue over catalog.items.v1.
 type Catalogue struct{}
@@ -85,23 +92,84 @@ type receiptRow struct {
 	Total     int64  `json:"total_minor"`
 }
 
-func (Receipts) day() ([]receiptRow, error) {
-	var all []receiptRow
-	for page := 0; page < maxReceiptPages; page++ {
-		raw, err := Query("sales.receipts.v1", map[string]int{"days_ago": 0, "offset": page * receiptPage, "limit": receiptPage})
+// receiptPager reads one business day of sales.receipts.v1 a page at a time,
+// caching pages and counting calls. The view is oldest first only, so the
+// newest receipts are found by galloping to the first short page and
+// bisecting back to the last full one: about 2*log2(n/100) calls, not n/100.
+type receiptPager struct {
+	pages map[int][]receiptRow
+	calls int
+}
+
+var errReceiptBudget = fmt.Errorf("hostview: sales.receipts.v1: more than %d calls", MaxReceiptCalls)
+
+// lastOffset is the highest page-aligned offset the view accepts.
+const lastOffset = maxReceiptOffset - maxReceiptOffset%receiptPage
+
+func (p *receiptPager) page(off int) ([]receiptRow, error) {
+	if rows, ok := p.pages[off]; ok {
+		return rows, nil
+	}
+	if p.calls >= MaxReceiptCalls {
+		return nil, errReceiptBudget
+	}
+	p.calls++
+	raw, err := Query("sales.receipts.v1", map[string]int{"days_ago": 0, "offset": off, "limit": receiptPage})
+	if err != nil {
+		return nil, fmt.Errorf("hostview: sales.receipts.v1: %w", err)
+	}
+	var rows []receiptRow
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil, fmt.Errorf("hostview: sales.receipts.v1: decode: %w", err)
+	}
+	if p.pages == nil {
+		p.pages = map[int][]receiptRow{}
+	}
+	p.pages[off] = rows
+	return rows, nil
+}
+
+// last returns the offset of the last non-empty page (0 for an empty day).
+// Offsets are multiples of receiptPage.
+func (p *receiptPager) last() (int, error) {
+	rows, err := p.page(0)
+	if err != nil || len(rows) < receiptPage {
+		return 0, err
+	}
+	lo, hi := 0, -1 // lo: a known full page; hi: a known short page
+	for step := receiptPage; hi < 0; step *= 2 {
+		if lo == lastOffset {
+			return lo, nil
+		}
+		off := min(lo+step, lastOffset)
+		rows, err := p.page(off)
 		if err != nil {
-			return nil, fmt.Errorf("hostview: sales.receipts.v1: %w", err)
+			return 0, err
 		}
-		var rows []receiptRow
-		if err := json.Unmarshal(raw, &rows); err != nil {
-			return nil, fmt.Errorf("hostview: sales.receipts.v1: decode: %w", err)
-		}
-		all = append(all, rows...)
-		if len(rows) < receiptPage {
-			break
+		if len(rows) == receiptPage {
+			lo = off
+		} else {
+			hi = off
 		}
 	}
-	return all, nil
+	for hi-lo > receiptPage {
+		mid := lo + (hi-lo)/receiptPage/2*receiptPage
+		rows, err := p.page(mid)
+		if err != nil {
+			return 0, err
+		}
+		if len(rows) == receiptPage {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	if rows, err := p.page(hi); err != nil {
+		return 0, err
+	} else if len(rows) > 0 {
+		return hi, nil
+	}
+	return lo, nil
 }
 
 func parseTime(s string) time.Time {
@@ -113,31 +181,55 @@ func parseTime(s string) time.Time {
 	return time.Time{}
 }
 
-// Recent lists today's receipts, newest first.
+// Recent lists today's newest receipts (the last one or two pages, at least
+// 100 when the day has that many), newest first.
 func (r Receipts) Recent() ([]calendar.Receipt, error) {
-	rows, err := r.day()
+	p := &receiptPager{}
+	last, err := p.last()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]calendar.Receipt, 0, len(rows))
-	for i := len(rows) - 1; i >= 0; i-- { // the view is oldest first
-		w := rows[i]
-		out = append(out, calendar.Receipt{ID: w.ID, No: w.No, At: parseTime(w.CreatedAt),
-			Total: money.FromMinor(w.Total), IsRefund: w.SaleType == "return"})
+	var out []calendar.Receipt
+	for off := last; off >= 0 && off >= last-receiptPage; off -= receiptPage {
+		rows, err := p.page(off)
+		if err != nil {
+			return nil, err
+		}
+		for i := len(rows) - 1; i >= 0; i-- { // the view is oldest first
+			w := rows[i]
+			out = append(out, calendar.Receipt{ID: w.ID, No: w.No, At: parseTime(w.CreatedAt),
+				Total: money.FromMinor(w.Total), IsRefund: w.SaleType == "return"})
+		}
+		if len(out) >= receiptPage {
+			break
+		}
 	}
 	return out, nil
 }
 
 // Paid reports whether saleID is a completed sale of today (not a return).
 // A visit is completed with a receipt of the business day it was paid on.
+// The day is searched newest page first within MaxReceiptCalls; a receipt
+// older than the budget reaches is reported not paid (refused, never
+// accepted unchecked).
 func (r Receipts) Paid(saleID string) (bool, error) {
-	rows, err := r.day()
+	p := &receiptPager{}
+	last, err := p.last()
 	if err != nil {
 		return false, err
 	}
-	for _, w := range rows {
-		if w.ID == saleID {
-			return w.SaleType != "return", nil
+	for off := last; off >= 0; off -= receiptPage {
+		rows, err := p.page(off)
+		if errors.Is(err, errReceiptBudget) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		for _, w := range rows {
+			if w.ID == saleID {
+				return w.SaleType != "return", nil
+			}
 		}
 	}
 	return false, nil

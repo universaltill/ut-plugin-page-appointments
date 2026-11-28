@@ -4,6 +4,7 @@ package hostview_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/universaltill/universal-till/sdk/plugin"
@@ -70,5 +71,64 @@ func TestShopCurrency(t *testing.T) {
 	})
 	if c, err := hostview.ShopCurrency(); err != nil || c != "EUR" {
 		t.Fatalf("%q %v", c, err)
+	}
+}
+
+// dayOf fakes sales.receipts.v1 over n receipts (oldest first, ids r0..r<n-1>)
+// with the view's real arg bounds, counting calls.
+func dayOf(t *testing.T, n int, calls *int) {
+	fake(t, func(name string, args json.RawMessage) (json.RawMessage, error) {
+		*calls++
+		var a struct{ DaysAgo, Offset, Limit int }
+		if err := json.Unmarshal(args, &a); err != nil {
+			t.Fatal(err)
+		}
+		if name != "sales.receipts.v1" || a.Limit < 1 || a.Limit > 100 || a.Offset < 0 || a.Offset > 1000000 {
+			t.Fatalf("view %s args %s", name, args)
+		}
+		rows := []map[string]any{}
+		for i := a.Offset; i < n && i < a.Offset+a.Limit; i++ {
+			rows = append(rows, map[string]any{"id": fmt.Sprintf("r%d", i), "receipt_no": fmt.Sprint(i), "sale_type": "sale",
+				"created_at": "2026-01-14T09:00:00Z", "total_minor": 100})
+		}
+		return json.Marshal(rows)
+	})
+}
+
+// A busy day (more receipts than the old 500 cap): the picker lists the
+// newest, newest first, within the per-request view budget (fix-plug
+// finding 5). The view is oldest-first only, so the plugin finds the tail.
+func TestReceiptsBusyDayListsTheNewest(t *testing.T) {
+	for _, n := range []int{0, 1, 99, 100, 101, 250, 500, 1234, 9999} {
+		calls := 0
+		dayOf(t, n, &calls)
+		rs, err := hostview.Receipts{}.Recent()
+		if err != nil {
+			t.Fatalf("n=%d: %v", n, err)
+		}
+		if n == 0 {
+			if len(rs) != 0 {
+				t.Fatalf("n=0: %+v", rs)
+			}
+			continue
+		}
+		if rs[0].ID != fmt.Sprintf("r%d", n-1) {
+			t.Fatalf("n=%d: newest = %s (calls %d)", n, rs[0].ID, calls)
+		}
+		want := n
+		if want > 100 {
+			want = 100
+		}
+		if len(rs) < want || (len(rs) > 1 && rs[1].ID != fmt.Sprintf("r%d", n-2)) {
+			t.Fatalf("n=%d: %d rows, second %s", n, len(rs), rs[1].ID)
+		}
+		if calls > hostview.MaxReceiptCalls {
+			t.Fatalf("n=%d: %d view calls", n, calls)
+		}
+		// the newest receipt is found as paid
+		calls = 0
+		if ok, err := (hostview.Receipts{}).Paid(fmt.Sprintf("r%d", n-1)); !ok || err != nil || calls > hostview.MaxReceiptCalls {
+			t.Fatalf("n=%d: newest not paid: %v %v calls %d", n, ok, err, calls)
+		}
 	}
 }
